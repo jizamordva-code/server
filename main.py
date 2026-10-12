@@ -1,3 +1,4 @@
+
 """
 Сервер игры (FastAPI + SQLAlchemy).  Запуск:  uvicorn main:app --host 0.0.0.0 --port $PORT
 
@@ -777,7 +778,7 @@ def _content_write(tag: str, value: str) -> None:
 
 
 def _content_admin_guard(admin_token: str = "") -> None:
-    expected = os.getenv("ADMIN_CONTENT_TOKEN", "")
+    expected = os.getenv("ADMIN_CONTENT_TOKEN", "") or os.getenv("ADMIN_PANEL_TOKEN", "")
     if expected:
         import hmac
         if not hmac.compare_digest(admin_token, expected):
@@ -839,6 +840,71 @@ def set_event(info: str = "", image_url: str = "", admin_token: str = ""):
     if image_url:
         _content_write("ui_event_image_url", image_url)
     return {"status": "ok", "event_data": get_event()}
+
+
+# ─── Панель администратора: баны и удаление комнат ───
+class AdminBan(Base):
+    __tablename__ = "admin_bans"
+    player_id = Column(String(255), primary_key=True)
+    created_at = Column(Float, default=0)
+
+
+Base.metadata.create_all(bind=engine, tables=[AdminBan.__table__])
+
+def _admin_guard(token: str):
+    import hmac
+    secret = os.getenv("ADMIN_PANEL_TOKEN", "")
+    if not secret or not hmac.compare_digest(token, secret):
+        raise HTTPException(status_code=403, detail="admin_auth_required")
+
+
+def _banned(db, player_id: str) -> bool:
+    return bool(player_id and db.query(AdminBan).filter(AdminBan.player_id == player_id).first())
+
+
+@api.get("/admin_bans")
+def admin_bans(admin_token: str = ""):
+    _admin_guard(admin_token)
+    with session() as db:
+        return {"players": [r.player_id for r in db.query(AdminBan).order_by(AdminBan.created_at.desc()).all()]}
+
+
+@api.get("/admin_set_ban")
+def admin_set_ban(player_id: str, banned: bool = True, admin_token: str = ""):
+    _admin_guard(admin_token)
+    player_id = player_id.strip()
+    if not player_id or len(player_id) > 255:
+        raise HTTPException(status_code=400, detail="invalid_player_id")
+    with MM_LOCK, session() as db:
+        row = db.query(AdminBan).filter(AdminBan.player_id == player_id).first()
+        if banned and not row:
+            db.add(AdminBan(player_id=player_id, created_at=now()))
+        if not banned and row:
+            db.delete(row)
+        if banned:
+            for room in db.query(Room).filter((Room.host_id == player_id) | (Room.guest_id == player_id)).all():
+                delete_room(db, room)
+            # Удаляем из сезонных лобби; игровые комнаты других участников остаются.
+            for slot in db.query(EventSlot).filter(EventSlot.name == player_id, EventSlot.is_bot == False).all():
+                room = db.query(EventRoom).filter(EventRoom.room_id == slot.room_id).first()
+                if room:
+                    remove_human(db, room, player_id, now())
+    return {"status": "ok", "player_id": player_id, "banned": banned}
+
+
+@api.get("/admin_delete_room")
+def admin_delete_room(room_id: str, admin_token: str = ""):
+    _admin_guard(admin_token)
+    with MM_LOCK, session() as db:
+        r = db.query(Room).filter(Room.room_id == room_id).first()
+        if r:
+            delete_room(db, r)
+            return {"status": "deleted", "mode": "1x1"}
+        er = db.query(EventRoom).filter(EventRoom.room_id == room_id).first()
+        if er:
+            delete_event_room(db, er)
+            return {"status": "deleted", "mode": "2x2"}
+    return {"status": "not_found"}
 
 
 @api.get("/get_player")
@@ -915,6 +981,10 @@ def _abandon_old_rooms(db, player_id, t):
 
 @api.get("/find_or_create_room")
 def find_or_create_room(player_id: str):
+    with session() as ban_db:
+        if _banned(ban_db, player_id):
+            # Совместимо с Lobby.gd: ожидает 15 секунд и открывает Bot.tscn.
+            return {"status": "created", "role": "host", "room_id": "bot_wait_" + player_id[:40]}
     with MM_LOCK, session() as db:
         t = now()
         cleanup_waiting = db.query(Room).filter(
@@ -983,6 +1053,8 @@ def leave_room(room_id: str, player_id: str = ""):
 
 @api.get("/check_room_status")
 def check_room_status(room_id: str):
+    if room_id.startswith("bot_wait_"):
+        return {"status": "success", "room_status": "WAITING"}
     with session() as db:
         room = db.query(Room).filter(Room.room_id == room_id).first()
         if not room:
@@ -1317,6 +1389,9 @@ def find_active_room(player_id: str = ""):
 
 @api.get("/create_event_room")
 def create_event_room(player_id: str, room_id: str = "", rating: int = 0):
+    with session() as check_db:
+        if _banned(check_db, player_id):
+            return {"status": "banned"}
     with MM_LOCK, session() as db:
         t = now()
         leave_other_event_rooms(db, player_id, None, t)
@@ -1338,6 +1413,9 @@ def create_event_room(player_id: str, room_id: str = "", rating: int = 0):
 
 @api.get("/join_event_room")
 def join_event_room(player_id: str, room_code: str = "", room_id: str = "", rating: int = 0):
+    with session() as check_db:
+        if _banned(check_db, player_id):
+            return {"status": "banned"}
     with MM_LOCK, session() as db:
         t = now()
         q = db.query(EventRoom)
