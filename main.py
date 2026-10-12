@@ -746,6 +746,101 @@ def health():
     return {"status": "ok", "time": now()}
 
 
+# ───────────── НАСТРОЙКИ ОФОРМЛЕНИЯ (совместимость со старым API) ─────────────
+# Значения сохраняются в существующей таблице kv_store, поэтому не теряются
+# при перезапуске Render. Установите ADMIN_CONTENT_TOKEN на Render, чтобы
+# ограничить изменение настроек: ?admin_token=... (старые клиенты без токена
+# продолжают читать /get_* как раньше).
+from fastapi import HTTPException
+
+CONTENT_DEFAULTS = {
+    "ui_background_url": "",
+    "ui_event_text": "",
+    "ui_event_info": "Удвоенные очки за победу в событии!",
+    "ui_event_image_url": "https://your-server.com/images/event_banner.png",
+}
+
+
+def _content_read(tag: str) -> str:
+    with session() as db:
+        row = db.query(Kv).filter(Kv.tag == tag).first()
+        return row.value if row else CONTENT_DEFAULTS[tag]
+
+
+def _content_write(tag: str, value: str) -> None:
+    with session() as db:
+        row = db.query(Kv).filter(Kv.tag == tag).first()
+        if row:
+            row.value, row.updated_at = value, now()
+        else:
+            db.add(Kv(tag=tag, value=value, updated_at=now()))
+
+
+def _content_admin_guard(admin_token: str = "") -> None:
+    expected = os.getenv("ADMIN_CONTENT_TOKEN", "")
+    if expected:
+        import hmac
+        if not hmac.compare_digest(admin_token, expected):
+            raise HTTPException(status_code=403, detail="admin_token_required")
+
+
+def _valid_url(url: str) -> bool:
+    from urllib.parse import urlsplit
+    p = urlsplit(url)
+    return p.scheme in ("https", "http") and bool(p.netloc)
+
+
+@api.get("/get_background")
+def get_background():
+    return {"background_url": _content_read("ui_background_url")}
+
+
+@api.get("/set_background")
+def set_background(url: str, admin_token: str = ""):
+    _content_admin_guard(admin_token)
+    if url and not _valid_url(url):
+        raise HTTPException(status_code=400, detail="invalid_url")
+    _content_write("ui_background_url", url)
+    return {"status": "ok", "background_url": url}
+
+
+@api.get("/get_event_info")
+def get_event_info():
+    return {"event_text": _content_read("ui_event_text")}
+
+
+@api.get("/set_event_info")
+def set_event_info(text: str, admin_token: str = ""):
+    _content_admin_guard(admin_token)
+    if len(text) > 4000:
+        raise HTTPException(status_code=400, detail="text_too_long")
+    _content_write("ui_event_text", text)
+    return {"status": "ok", "event_text": text}
+
+
+@api.get("/get_event")
+def get_event():
+    return {
+        "info": _content_read("ui_event_info"),
+        "image_url": _content_read("ui_event_image_url"),
+    }
+
+
+@api.get("/set_event")
+def set_event(info: str = "", image_url: str = "", admin_token: str = ""):
+    _content_admin_guard(admin_token)
+    if len(info) > 4000:
+        raise HTTPException(status_code=400, detail="text_too_long")
+    if image_url and not _valid_url(image_url):
+        raise HTTPException(status_code=400, detail="invalid_url")
+    # Точно как старый сервер: пустые параметры не перезаписывают значения.
+    if info:
+        _content_write("ui_event_info", info)
+    if image_url:
+        _content_write("ui_event_image_url", image_url)
+    return {"status": "ok", "event_data": get_event()}
+
+
 @api.get("/get_player")
 def get_player(player_id: str):
     with session() as db:
