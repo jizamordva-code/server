@@ -61,7 +61,12 @@ if IS_SQLITE:
         # сразу берём блокировку записи: нет «database is locked» при апгрейде чтения до записи
         conn.exec_driver_sql("BEGIN IMMEDIATE")
 else:
-    engine = create_engine(DATABASE_URL, pool_pre_ping=True, pool_recycle=300)
+    # pool_pre_ping=True делал лишний SELECT 1 (= лишний сетевой круг до базы) на КАЖДЫЙ запрос.
+    # Вместо него соединения обновляются раньше, чем Neon усыпляет базу (5 минут простоя).
+    engine = create_engine(
+        DATABASE_URL, pool_pre_ping=False, pool_recycle=240, pool_size=5, max_overflow=5,
+        connect_args={"connect_timeout": 10, "keepalives": 1, "keepalives_idle": 30,
+                      "keepalives_interval": 10, "keepalives_count": 3})
 
 SessionLocal = sessionmaker(autocommit=False, autoflush=False, bind=engine)
 Base = declarative_base()
@@ -729,6 +734,18 @@ async def lifespan(_app):
 
 app = FastAPI(lifespan=lifespan)
 app.add_middleware(CORSMiddleware, allow_origins=["*"], allow_methods=["*"], allow_headers=["*"])
+
+
+@app.middleware("http")
+async def timing_middleware(request, call_next):
+    """Сколько сервер тратит на запрос. Медленные (>400 мс) попадают в лог Render."""
+    t0 = time.perf_counter()
+    response = await call_next(request)
+    ms = (time.perf_counter() - t0) * 1000
+    response.headers["X-Process-Time-ms"] = f"{ms:.0f}"
+    if ms > 400 and not request.url.path.endswith(("/health", "/ping")):
+        log.warning("МЕДЛЕННО %s %s — %.0f мс", request.method, request.url.path, ms)
+    return response
 api = APIRouter()
 
 _relay = {}  # (room_id, player_id) -> (время, состояние): мгновенный обмен состоянием, не хранится в БД
@@ -740,6 +757,25 @@ _relay_lock = threading.Lock()
 @app.get("/")
 def root():
     return {"status": "server_online"}
+
+
+@api.get("/ping")
+def ping():
+    """Без базы данных: чистое время ответа сервера."""
+    return {"status": "ok", "t": now()}
+
+
+@api.get("/ping_db")
+def ping_db():
+    """3 запроса к базе подряд. 2-й и 3-й показывают расстояние до БД: 1–5 мс = рядом, 80+ мс = БД в другом регионе."""
+    from sqlalchemy import text
+    times = []
+    with session() as db:
+        for _ in range(3):
+            t0 = time.perf_counter()
+            db.execute(text("SELECT 1"))
+            times.append(round((time.perf_counter() - t0) * 1000, 1))
+    return {"status": "ok", "db": "sqlite" if IS_SQLITE else "postgres", "db_query_ms": times}
 
 
 @api.get("/health")
@@ -1190,7 +1226,8 @@ def capture_cell(room_id: str, player_id: str, cell_index: int):
             if m.winner:
                 room.status = "FINISHED"
         return {"status": "ok", "cost": cost, "winner": m.winner,
-                "rating": m.host_rating if is_host else m.guest_rating}
+                "rating": m.host_rating if is_host else m.guest_rating,
+                "state": match_dict(m, cells)}
 
 
 def _enemy_cells(cells, enemy, m):
@@ -1248,7 +1285,7 @@ def use_cell(room_id: str, player_id: str, cell_index: int):
                     cells[n].rev_a = True
                 else:
                     cells[n].rev_b = True
-        return {"status": "ok", "cell_type": typ}
+        return {"status": "ok", "cell_type": typ, "state": match_dict(m, cells)}
 
 
 @api.get("/atomic_strike")
