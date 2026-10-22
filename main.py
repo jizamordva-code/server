@@ -751,7 +751,7 @@ async def timing_middleware(request, call_next):
 api = APIRouter()
 
 PERMANENT_TYPES = {"red_occupied", "brown_passcode", "blue_light", "yellow_energy"}
-_pending_loss = defaultdict(int)   # 1x1: сколько 💀 у игрока украли с последнего опроса
+_pending_loss = defaultdict(int)   # legacy notifications, when the caller lacks theft_ack
 _ev_loss = defaultdict(int)        # 2x2: то же для сезонного режима
 
 _relay = {}  # (room_id, player_id) -> (время, состояние): мгновенный обмен состоянием, не хранится в БД
@@ -1117,9 +1117,27 @@ def create_match(room_id: str):
         return {"status": "created"}
 
 
+def _theft_total(db, room_id: str, victim_id: str) -> int:
+    tag = "theft:" + room_id + ":" + victim_id
+    record = db.query(Kv).filter(Kv.tag == tag).first()
+    return int(record.value) if record else 0
+
+
+def _register_theft(db, room_id: str, victim_id: str, amount: int) -> None:
+    if amount <= 0: return
+    tag = "theft:" + room_id + ":" + victim_id
+    record = db.query(Kv).filter(Kv.tag == tag).first()
+    if record is None:
+        record = Kv(tag=tag, value="0", updated_at=now())
+        db.add(record)
+    record.value = str(int(record.value or 0) + amount)
+    record.updated_at = now()
+    _pending_loss[(room_id, victim_id)] += amount
+
+
 @api.get("/get_match")
-def get_match(room_id: str, player_id: str = "", skulls: int = -1, energy: int = -1):
-    with session() as db:
+def get_match(room_id: str, player_id: str = "", skulls: int = -1, energy: int = -1, theft_ack: int = -1):
+    with room_lock(room_id), session() as db:
         m = get_match_row(db, room_id)
         if not m:
             return {"status": "not_found"}
@@ -1127,13 +1145,20 @@ def get_match(room_id: str, player_id: str = "", skulls: int = -1, energy: int =
         if room:
             touch(room)
         # клиент присылает свои 💀 — так сервер знает, сколько можно украсть
+        victim_total = _theft_total(db, room_id, player_id) if player_id in (m.host_id,m.guest_id) else 0
+        # The client sends its previous balance. Apply all as-yet unacknowledged
+        # thefts before storing it; otherwise its old poll undoes an actual theft.
+        # Legacy clients have no ack; apply and consume only the first pending loss.
+        pending_legacy = _pending_loss.pop((room_id,player_id),0) if theft_ack < 0 and player_id else 0
+        unacked = max(0, victim_total - max(theft_ack,0)) if theft_ack >= 0 else pending_legacy
         if player_id and skulls >= 0:
             if player_id == m.host_id:
-                m.host_skulls, m.host_energy = skulls, max(0, energy)
+                m.host_skulls, m.host_energy = max(0,skulls-unacked), max(0, energy)
             elif player_id == m.guest_id:
-                m.guest_skulls, m.guest_energy = skulls, max(0, energy)
+                m.guest_skulls, m.guest_energy = max(0,skulls-unacked), max(0, energy)
         d = match_dict(m, load_cells(db, "m", room_id))
-        d["skulls_lost"] = _pending_loss.pop((room_id, player_id), 0) if player_id else 0
+        d["theft_total"] = victim_total
+        d["skulls_lost"] = unacked
         d["server_time"] = now()  # клиент выравнивает свои часы по серверным (для таймеров дебаффов)
         return d
 
@@ -1229,6 +1254,8 @@ def capture_cell(room_id: str, player_id: str, cell_index: int):
             m.guest_rating += gain
         cell.owner = my
         cell.ability_spent = False
+        cell.cooldown_end = 0
+        cell.blocked = "[]"
         if is_host:
             cell.rev_a = True
         else:
@@ -1267,23 +1294,25 @@ def use_cell(room_id: str, player_id: str, cell_index: int):
             return {"status": "not_owner"}
         typ, t = cell.type, int(now())
 
+        if player_id not in (m.host_id,m.guest_id):
+            return {"status": "not_in_match"}
+        if (cell.cooldown_end or 0) > t and cell.blocked == typ:
+            return {"status": "on_cooldown"}
         if typ in PERMANENT_TYPES:  # разовая клетка: повторно нельзя, пока её не отобрал соперник
             if cell.ability_spent:
                 return {"status": "already_used"}
             cell.ability_spent = True
 
+        temporary_reveal_indices = []
         if typ == "yellow_atomic":
             targets = _enemy_cells(cells, enemy, m)
             if targets:
                 cells[random.choice(targets)].owner = 0
         elif typ == "green_vacant":
-            hidden = [c for c in cells if c.owner == 0]
+            # Only temporary previews; never alter rev_a/rev_b permanently.
+            hidden = [c for c in cells if c.owner == 0 and c.idx != cell_index]
             random.shuffle(hidden)
-            for c in hidden[:2]:
-                if is_host:
-                    c.rev_a = True
-                else:
-                    c.rev_b = True
+            temporary_reveal_indices = [c.idx for c in hidden[:2]]
         elif typ == "red_exit":
             if is_host:
                 m.guest_hidden_until = t + 10
@@ -1300,12 +1329,29 @@ def use_cell(room_id: str, player_id: str, cell_index: int):
             else:
                 m.guest_protection_until = t + 10
         elif typ == "blue_hydralic":
-            for n in get_neighbors(cell_index):
-                if is_host:
-                    cells[n].rev_a = True
-                else:
-                    cells[n].rev_b = True
-        return {"status": "ok", "cell_type": typ, "state": match_dict(m, cells)}
+            # Diagonal scouting (top-left, top-right, bottom-left, bottom-right)
+            rr, cc = divmod(cell_index, 5)
+            temporary_reveal_indices = [(rr+dr)*5+cc+dc for dr in (-1,1) for dc in (-1,1)
+                                        if 0 <= rr+dr < 5 and 0 <= cc+dc < 5]
+        stolen = 0
+        if typ == "blue_gravity":
+            victim_id = m.guest_id if is_host else m.host_id
+            balance_attr = "guest_skulls" if is_host else "host_skulls"
+            mine_attr = "host_skulls" if is_host else "guest_skulls"
+            stolen = min(30,max(0,int(getattr(m,balance_attr) or 0)))
+            setattr(m,balance_attr,int(getattr(m,balance_attr))-stolen)
+            setattr(m,mine_attr,int(getattr(m,mine_attr))+stolen)
+            _register_theft(db,room_id,victim_id,stolen)
+        cooldown = {"blue_gravity":15,"red_flamew":20,"red_exit":6,"yellow_thri_line":10,"yellow_atomic":20,
+                    "blue_hydralic":4,"green_vacant":5,"yellow_two_line":5,"brown_storage":5,"realise":5,
+                    "red_heal":10,"red_base":20}.get(typ,0)
+        if cooldown > 0:
+            cell.cooldown_end = t + cooldown
+            cell.blocked = typ
+        return {"status": "ok", "cell_type": typ, "stolen": stolen,
+                "temporary_reveal_indices": temporary_reveal_indices,
+                "temporary_reveal_seconds": 5.0,
+                "state": match_dict(m, cells)}
 
 
 @api.get("/atomic_strike")
@@ -1317,6 +1363,8 @@ def atomic_strike(room_id: str, player_id: str):
             return {"status": "no_match"}
         if m.winner != "":
             return {"status": "finished"}
+        if player_id not in (m.host_id, m.guest_id):
+            return {"status": "not_in_match"}
         cells = load_cells(db, "m", room_id)
         enemy = 2 if player_id == m.host_id else 1
         targets = _enemy_cells(cells, enemy, m)
@@ -1335,6 +1383,8 @@ def apply_debuff(room_id: str, player_id: str, debuff_type: str, duration: int =
         m = get_match_row(db, room_id)
         if not m:
             return {"status": "no_match"}
+        if player_id not in (m.host_id, m.guest_id):
+            return {"status": "not_in_match"}
         is_host = player_id == m.host_id
         until = int(now()) + duration
         if debuff_type in ("hide", "hidden"):
@@ -1355,6 +1405,9 @@ def steal_skulls(room_id: str, player_id: str, amount: int):
         m = get_match_row(db, room_id)
         if not m:
             return {"status": "no_match"}
+        if player_id not in (m.host_id,m.guest_id):
+            return {"status": "not_in_match"}
+        amount = max(0,min(int(amount),30))
         if player_id == m.host_id:
             stolen = max(0, min(amount, m.guest_skulls))
             m.host_skulls += stolen
@@ -1366,7 +1419,7 @@ def steal_skulls(room_id: str, player_id: str, amount: int):
             m.host_skulls -= stolen
             victim = m.host_id
         if stolen and victim:
-            _pending_loss[(room_id, victim)] += stolen  # жертва узнает при следующем опросе
+            _register_theft(db,room_id,victim,stolen)
         return {"status": "ok", "stolen": stolen}
 
 
@@ -1587,6 +1640,15 @@ def update_event_match(room_id: str, state: dict = Body(...)):
         em = ev_match(db, room_id)
         if not em:
             return {"status": "not_found"}
+        if em.winner or em.status == "FINISHED":
+            return {"status": "finished"}
+        # The host may only upload the initial map. A delayed or repeated POST
+        # must never destroy the authoritative in-progress cells and balances.
+        if em.status != "NOT_READY":
+            return {"status": "already_initialized"}
+        cells_payload = state.get("cells", [])
+        if not isinstance(cells_payload, list) or len(cells_payload) != EVENT_CELLS:
+            return {"status": "invalid_map"}
         set_event_state(db, em, state)
         em.last_seen = now()
         room = ev_room(db, room_id)
@@ -1595,9 +1657,27 @@ def update_event_match(room_id: str, state: dict = Body(...)):
         return {"status": "updated"}
 
 
+def _event_theft_total(db, room_id: str, player_id: str) -> int:
+    tag = "event_theft:" + room_id + ":" + player_id
+    record = db.query(Kv).filter(Kv.tag == tag).first()
+    return int(record.value) if record else 0
+
+
+def _register_event_theft(db, room_id: str, player_id: str, stolen: int) -> None:
+    if stolen <= 0: return
+    tag = "event_theft:" + room_id + ":" + player_id
+    record = db.query(Kv).filter(Kv.tag == tag).first()
+    if record is None:
+        record = Kv(tag=tag, value="0", updated_at=now())
+        db.add(record)
+    record.value = str(int(record.value or 0) + stolen)
+    record.updated_at = now()
+    _ev_loss[(room_id,player_id)] += stolen
+
+
 @api.get("/get_event_match")
 def get_event_match(room_id: str, player_id: str = ""):
-    with session() as db:
+    with room_lock(room_id), session() as db:
         em = ev_match(db, room_id)
         if not em:
             return {"status": "not_found"}
@@ -1611,6 +1691,7 @@ def get_event_match(room_id: str, player_id: str = ""):
         d = event_state_dict(db, em)
         if player_id:
             d["skulls_lost"] = _ev_loss.pop((room_id, player_id), 0)
+            d["theft_total"] = _event_theft_total(db,room_id,player_id)
         return d
 
 
@@ -1642,6 +1723,11 @@ def event_capture(room_id: str, player_id: str, cell_index: int):
         if not any(cells[n].owner == team for n in event_neighbors(cell_index)):
             return {"status": "not_connected"}
         cost = 50 if cell.owner == 0 else 70
+        own_cells = [c for c in cells if c.owner == team and c.ability_spent]
+        if cell.owner == 0 and any(c.type == "red_occupied" for c in own_cells):
+            cost = 40
+        if cell.owner == enemy and any(c.type == "brown_passcode" for c in own_cells):
+            cost = 60
         if me.skulls < cost:
             return {"status": "no_skulls"}
         me.skulls -= cost
@@ -1705,6 +1791,19 @@ def event_use(room_id: str, player_id: str, cell_index: int):
             return {"status": "no_energy"}
         me.energy -= energy_cost
         _apply_event_ability(db, em, cells, cell.type, team, enemy, t)
+        # Server applies resource abilities exactly once. Client must NOT resend
+        # an outdated local balance through /update_event_resources.
+        if cell.type == "yellow_two_line":
+            me.skulls += 20
+        elif cell.type == "brown_storage":
+            me.energy += 10
+        elif cell.type == "realise":
+            me.skulls += 5
+            me.energy += 5
+        elif cell.type == "red_heal":
+            me.skulls += 100
+        elif cell.type == "red_base":
+            me.skulls = int(me.skulls * 1.5)
         stolen = 0
         if cell.type == "blue_gravity":  # настоящая кража: 30 💀 у самого богатого противника
             foes = [f for f in db.query(EventStat).filter(EventStat.room_id == room_id, EventStat.team == enemy).all() if f.skulls > 0]
@@ -1713,23 +1812,27 @@ def event_use(room_id: str, player_id: str, cell_index: int):
                 stolen = min(30, victim.skulls)
                 victim.skulls -= stolen
                 me.skulls += stolen
-                _ev_loss[(room_id, victim.name)] += stolen
+                _register_event_theft(db,room_id,victim.name,stolen)
         if cooldown > 0:
             cell.cooldown_end = t + cooldown
         if cooldown == -1:
             cell.ability_spent = True
-        return {"status": "ok", "stolen": stolen}
+        return {"status": "ok", "stolen": stolen,
+                "resources": {"skulls":me.skulls,"energy":me.energy,"rating":me.rating}}
 
 
 @api.get("/update_event_resources")
-def update_event_resources(room_id: str, player_id: str, skulls: int, energy: int, rating: int):
+def update_event_resources(room_id: str, player_id: str, skulls: int, energy: int, rating: int, theft_ack: int = -1):
     with room_lock(room_id), session() as db:
         if not ev_match(db, room_id):
             return {"status": "no_match"}
         me = _ev_player(db, room_id, player_id)
         if not me:
             return {"status": "player_not_found"}
-        me.skulls, me.energy, me.rating = skulls, energy, rating
+        owed = max(0,_event_theft_total(db,room_id,player_id)-theft_ack) if theft_ack >= 0 else 0
+        me.skulls = max(0,int(skulls)-owed)
+        me.energy = max(0,int(energy))
+        me.rating = max(0,int(rating))
         return {"status": "ok"}
 
 
