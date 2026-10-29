@@ -1,0 +1,15 @@
+# Blueprint для Render (необязательно — можно создать сервис вручную через дашборд)
+services:
+  - type: web
+    name: cyber-chase
+    runtime: node
+    plan: free
+    rootDir: server
+    buildCommand: npm install
+    startCommand: node server.js
+    healthCheckPath: /health
+    envVars:
+      - key: BOT_TOKEN
+        sync: false        # вставьте токен от @BotFather в дашборде
+      - key: TG_APP_LINK
+        sync: false        # например https://t.me/MyBot/play
