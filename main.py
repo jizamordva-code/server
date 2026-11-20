@@ -24,7 +24,7 @@ import time
 from collections import defaultdict
 from contextlib import asynccontextmanager, contextmanager
 
-from fastapi import APIRouter, Body, FastAPI
+from fastapi import APIRouter, Body, FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
 from sqlalchemy import (BigInteger, Boolean, Column, Float, Integer, String,
                         Text, UniqueConstraint, case, create_engine, event,
@@ -357,7 +357,7 @@ def delete_room(db, room):
 
 ABILITY_STATS_2V2 = {  # [энергия, перезарядка (-1 = одноразовая, постоянный эффект)]
     "yellow_two_line": [0, 5], "brown_storage": [0, 5], "realise": [0, 5],
-    "red_heal": [60, 10], "blue_hydralic": [10, 4], "green_vacant": [10, 5],
+    "red_heal": [60, 10], "blue_hydralic": [10, -1], "green_vacant": [10, 5],
     "red_base": [10, 20], "red_exit": [10, 6], "red_flamew": [20, 20],
     "red_occupied": [20, -1], "yellow_thri_line": [15, 10], "yellow_energy": [25, -1],
     "blue_gravity": [20, 15], "blue_light": [20, -1], "brown_passcode": [25, -1],
@@ -366,6 +366,13 @@ ABILITY_STATS_2V2 = {  # [энергия, перезарядка (-1 = одно�
 EVENT_SIZE = 7
 EVENT_CELLS = 49
 EVENT_STARTS = {1: [0, 6], 2: [42, 48]}
+EVENT_CELL_TYPES = [
+    "blue_gravity", "blue_hydralic", "blue_light", "blue_block",
+    "brown_passcode", "brown_storage", "brown_useless", "green_vacant",
+    "realise", "red_base", "red_exit", "red_flamew", "red_heal",
+    "red_occupied", "yellow_atomic", "yellow_energy", "yellow_thri_line",
+    "yellow_two_line",
+]
 
 
 def event_neighbors(idx):
@@ -750,7 +757,7 @@ async def timing_middleware(request, call_next):
     return response
 api = APIRouter()
 
-PERMANENT_TYPES = {"red_occupied", "brown_passcode", "blue_light", "yellow_energy"}
+PERMANENT_TYPES = {"red_occupied", "brown_passcode", "blue_light", "yellow_energy", "blue_hydralic"}
 _pending_loss = defaultdict(int)   # legacy notifications, when the caller lacks theft_ack
 _ev_loss = defaultdict(int)        # 2x2: то же для сезонного режима
 
@@ -791,8 +798,8 @@ def health():
 
 # ───────────── НАСТРОЙКИ ОФОРМЛЕНИЯ (совместимость со старым API) ─────────────
 # Значения сохраняются в существующей таблице kv_store, поэтому не теряются
-# при перезапуске Render. Установите ADMIN_CONTENT_TOKEN на Render, чтобы
-# ограничить изменение настроек: ?admin_token=... (старые клиенты без токена
+# при перезапуске Render. Установите ADMIN_PANEL_TOKEN на Render, чтобы
+# ограничить изменение настроек через X-Admin-Token (старые клиенты без токена
 # продолжают читать /get_* как раньше).
 from fastapi import HTTPException
 
@@ -820,11 +827,12 @@ def _content_write(tag: str, value: str) -> None:
 
 
 def _content_admin_guard(admin_token: str = "") -> None:
-    expected = os.getenv("ADMIN_CONTENT_TOKEN", "") or os.getenv("ADMIN_PANEL_TOKEN", "")
-    if expected:
-        import hmac
-        if not hmac.compare_digest(admin_token, expected):
-            raise HTTPException(status_code=403, detail="admin_token_required")
+    expected = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
+    if not expected:
+        raise HTTPException(status_code=503, detail="admin_token_not_configured")
+    import hmac
+    if not admin_token or not hmac.compare_digest(admin_token, expected):
+        raise HTTPException(status_code=403, detail="admin_token_required")
 
 
 def _valid_url(url: str) -> bool:
@@ -839,8 +847,8 @@ def get_background():
 
 
 @api.get("/set_background")
-def set_background(url: str, admin_token: str = ""):
-    _content_admin_guard(admin_token)
+def set_background(url: str, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _content_admin_guard(x_admin_token or admin_token)
     if url and not _valid_url(url):
         raise HTTPException(status_code=400, detail="invalid_url")
     _content_write("ui_background_url", url)
@@ -853,8 +861,8 @@ def get_event_info():
 
 
 @api.get("/set_event_info")
-def set_event_info(text: str, admin_token: str = ""):
-    _content_admin_guard(admin_token)
+def set_event_info(text: str, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _content_admin_guard(x_admin_token or admin_token)
     if len(text) > 4000:
         raise HTTPException(status_code=400, detail="text_too_long")
     _content_write("ui_event_text", text)
@@ -870,16 +878,16 @@ def get_event():
 
 
 @api.get("/set_event")
-def set_event(info: str = "", image_url: str = "", admin_token: str = ""):
-    _content_admin_guard(admin_token)
-    if len(info) > 4000:
+def set_event(info: str | None = None, image_url: str | None = None, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _content_admin_guard(x_admin_token or admin_token)
+    if info is not None and len(info) > 4000:
         raise HTTPException(status_code=400, detail="text_too_long")
     if image_url and not _valid_url(image_url):
         raise HTTPException(status_code=400, detail="invalid_url")
-    # Точно как старый сервер: пустые параметры не перезаписывают значения.
-    if info:
+    # Явно переданная пустая строка очищает значение; пропущенный параметр не меняет.
+    if info is not None:
         _content_write("ui_event_info", info)
-    if image_url:
+    if image_url is not None:
         _content_write("ui_event_image_url", image_url)
     return {"status": "ok", "event_data": get_event()}
 
@@ -895,9 +903,18 @@ Base.metadata.create_all(bind=engine, tables=[AdminBan.__table__])
 
 def _admin_guard(token: str):
     import hmac
-    secret = os.getenv("ADMIN_PANEL_TOKEN", "")
-    if not secret or not hmac.compare_digest(token, secret):
+    secret = os.getenv("ADMIN_PANEL_TOKEN", "").strip()
+    if not secret:
+        raise HTTPException(status_code=503, detail="admin_token_not_configured")
+    if not token or not hmac.compare_digest(token, secret):
         raise HTTPException(status_code=403, detail="admin_auth_required")
+
+
+@api.get("/admin_auth_check")
+def admin_auth_check(admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    """Проверка токена для открытия административных операций."""
+    _admin_guard(x_admin_token or admin_token)
+    return {"status": "ok"}
 
 
 def _banned(db, player_id: str) -> bool:
@@ -905,15 +922,15 @@ def _banned(db, player_id: str) -> bool:
 
 
 @api.get("/admin_bans")
-def admin_bans(admin_token: str = ""):
-    _admin_guard(admin_token)
+def admin_bans(admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _admin_guard(x_admin_token or admin_token)
     with session() as db:
         return {"players": [r.player_id for r in db.query(AdminBan).order_by(AdminBan.created_at.desc()).all()]}
 
 
 @api.get("/admin_set_ban")
-def admin_set_ban(player_id: str, banned: bool = True, admin_token: str = ""):
-    _admin_guard(admin_token)
+def admin_set_ban(player_id: str, banned: bool = True, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _admin_guard(x_admin_token or admin_token)
     player_id = player_id.strip()
     if not player_id or len(player_id) > 255:
         raise HTTPException(status_code=400, detail="invalid_player_id")
@@ -935,8 +952,8 @@ def admin_set_ban(player_id: str, banned: bool = True, admin_token: str = ""):
 
 
 @api.get("/admin_delete_room")
-def admin_delete_room(room_id: str, admin_token: str = ""):
-    _admin_guard(admin_token)
+def admin_delete_room(room_id: str, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _admin_guard(x_admin_token or admin_token)
     with MM_LOCK, session() as db:
         r = db.query(Room).filter(Room.room_id == room_id).first()
         if r:
@@ -947,6 +964,33 @@ def admin_delete_room(room_id: str, admin_token: str = ""):
             delete_event_room(db, er)
             return {"status": "deleted", "mode": "2x2"}
     return {"status": "not_found"}
+
+
+@api.get("/admin_update_score")
+def admin_update_score(player_id: str, add_score: int, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    """Административная корректировка рейтинга; игровой /update_score остаётся совместимым с клиентом."""
+    _admin_guard(x_admin_token or admin_token)
+    player_id = player_id.strip()
+    if not player_id or len(player_id) > 255:
+        raise HTTPException(status_code=400, detail="invalid_player_id")
+    if abs(add_score) > 2147483647:
+        raise HTTPException(status_code=400, detail="invalid_score_delta")
+    with session() as db:
+        ensure_player(db, player_id)
+        new_total = Player.total_ex + int(add_score)
+        db.execute(update(Player).where(Player.player_id == player_id)
+                   .values(total_ex=case((new_total < 0, 0), else_=new_total)))
+        total = db.query(Player.total_ex).filter(Player.player_id == player_id).scalar()
+    log.info("[ADMIN UPDATE SCORE] %s %+d = %s", player_id, add_score, total)
+    return {"status": "updated", "player_id": player_id, "total_ex": total}
+
+
+@api.get("/admin_cleanup_old_rooms")
+def admin_cleanup_old_rooms(admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    """Административная очистка комнат. Публичный cleanup для игрового клиента не меняется."""
+    _admin_guard(x_admin_token or admin_token)
+    res = run_cleanup()
+    return {"status": "cleaned", "deleted": res["rooms"] + res["event_rooms"], **res}
 
 
 @api.get("/get_player")
@@ -1247,6 +1291,9 @@ def capture_cell(room_id: str, player_id: str, cell_index: int):
             if enemy_spent("blue_light"):
                 cost = 100  # у владельца включён blue_light — отбить клетку дороже
 
+        # blue_hydralic is a one-time passive: every later capture gives +1 energy
+        # while at least one activated blue_hydralic tile remains under this player's control.
+        energy_bonus = 1 if mine_spent("blue_hydralic") else 0
         gain = 1 if cell.owner == 0 else 2
         if is_host:
             m.host_rating += gain
@@ -1267,7 +1314,7 @@ def capture_cell(room_id: str, player_id: str, cell_index: int):
             room.last_seen = now()
             if m.winner:
                 room.status = "FINISHED"
-        return {"status": "ok", "cost": cost, "winner": m.winner,
+        return {"status": "ok", "cost": cost, "energy_bonus": energy_bonus, "winner": m.winner,
                 "rating": m.host_rating if is_host else m.guest_rating,
                 "state": match_dict(m, cells)}
 
@@ -1328,11 +1375,6 @@ def use_cell(room_id: str, player_id: str, cell_index: int):
                 m.host_protection_until = t + 10
             else:
                 m.guest_protection_until = t + 10
-        elif typ == "blue_hydralic":
-            # Diagonal scouting (top-left, top-right, bottom-left, bottom-right)
-            rr, cc = divmod(cell_index, 5)
-            temporary_reveal_indices = [(rr+dr)*5+cc+dc for dr in (-1,1) for dc in (-1,1)
-                                        if 0 <= rr+dr < 5 and 0 <= cc+dc < 5]
         stolen = 0
         if typ == "blue_gravity":
             victim_id = m.guest_id if is_host else m.host_id
@@ -1343,7 +1385,7 @@ def use_cell(room_id: str, player_id: str, cell_index: int):
             setattr(m,mine_attr,int(getattr(m,mine_attr))+stolen)
             _register_theft(db,room_id,victim_id,stolen)
         cooldown = {"blue_gravity":15,"red_flamew":20,"red_exit":6,"yellow_thri_line":10,"yellow_atomic":20,
-                    "blue_hydralic":4,"green_vacant":5,"yellow_two_line":5,"brown_storage":5,"realise":5,
+                    "green_vacant":5,"yellow_two_line":5,"brown_storage":5,"realise":5,
                     "red_heal":10,"red_base":20}.get(typ,0)
         if cooldown > 0:
             cell.cooldown_end = t + cooldown
@@ -1731,6 +1773,8 @@ def event_capture(room_id: str, player_id: str, cell_index: int):
         if me.skulls < cost:
             return {"status": "no_skulls"}
         me.skulls -= cost
+        energy_bonus = 1 if any(c.owner == team and c.type == "blue_hydralic" and c.ability_spent for c in cells) else 0
+        me.energy += energy_bonus
         me.rating += 1 if cell.owner == 0 else 2
         cell.owner = team
         cell.ability_spent = False
@@ -1745,7 +1789,8 @@ def event_capture(room_id: str, player_id: str, cell_index: int):
             if room:
                 room.status, room.finished_at = "FINISHED", now()
             log.info("[WIN] %s захватила обе стартовые клетки соперника", em.winner)
-        return {"status": "ok", "cost": cost}
+        return {"status": "ok", "cost": cost, "energy_bonus": energy_bonus,
+                "resources": {"skulls": me.skulls, "energy": me.energy, "rating": me.rating}}
 
 
 def _apply_event_ability(db, em, cells, typ, team, enemy, t):
@@ -1831,9 +1876,89 @@ def update_event_resources(room_id: str, player_id: str, skulls: int, energy: in
             return {"status": "player_not_found"}
         owed = max(0,_event_theft_total(db,room_id,player_id)-theft_ack) if theft_ack >= 0 else 0
         me.skulls = max(0,int(skulls)-owed)
-        me.energy = max(0,int(energy))
+        # Ability energy is authoritative on the server (including capture bonuses).
+        # A delayed client resource update must never overwrite it.
         me.rating = max(0,int(rating))
         return {"status": "ok"}
+
+
+
+# ─── Администратор: тестовые комнаты 1×1 без вторжения в публичный матчмейкинг ───
+@api.get("/admin_create_test_match")
+def admin_create_test_match(admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _admin_guard(x_admin_token or admin_token)
+    import secrets
+    with MM_LOCK, session() as db:
+        t = now()
+        rid = "adm_test_" + secrets.token_hex(10)
+        pid = "adm_host_" + secrets.token_hex(8)
+        db.add(Room(room_id=rid, host_id=pid, guest_id="", status="WAITING", created_at=t, last_seen=t))
+        return {"status": "created", "role": "host", "room_id": rid, "player_id": pid}
+
+
+@api.get("/admin_create_test_event_match")
+def admin_create_test_event_match(admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    """Create an isolated 2x2 test board whose four seats can be controlled from the desktop panel."""
+    _admin_guard(x_admin_token or admin_token)
+    import secrets
+    with MM_LOCK, session() as db:
+        t = now()
+        rid = "adm_event_test_" + secrets.token_hex(8)
+        names = ["adm_evt_" + secrets.token_hex(5) for _ in range(4)]
+        room = EventRoom(room_id=rid, room_code=new_room_code(db), status="RUNNING",
+                         host_name=names[0], created_at=t, start_at=t, started_at=t, last_seen=t)
+        db.add(room)
+        db.flush()
+        for slot, name in enumerate(names):
+            team = SLOT_TEAM[slot]
+            idx = slot % 2
+            db.add(EventSlot(room_id=rid, slot=slot, name=name, rating=0,
+                             is_bot=False, join_at=t, last_seen=t))
+            db.add(EventStat(room_id=rid, team=team, idx=idx, name=name,
+                             skulls=50, energy=0, rating=0))
+        db.add(EventMatch(room_id=rid, status="RUNNING", created_at=t, last_seen=t))
+        pool = [kind for kind in EVENT_CELL_TYPES for _ in range(2)]
+        random.shuffle(pool)
+        visible_team1 = set(EVENT_STARTS[1])
+        visible_team2 = set(EVENT_STARTS[2])
+        for start in EVENT_STARTS[1]:
+            visible_team1.update(event_neighbors(start))
+        for start in EVENT_STARTS[2]:
+            visible_team2.update(event_neighbors(start))
+        for i in range(EVENT_CELLS):
+            typ = pool[i] if i < len(pool) else random.choice(EVENT_CELL_TYPES)
+            owner = 0
+            if i in EVENT_STARTS[1]:
+                owner, typ = 1, "yellow_two_line"
+            elif i in EVENT_STARTS[2]:
+                owner, typ = 2, "yellow_two_line"
+            db.add(Cell(scope="e", room_id=rid, idx=i, type=typ, owner=owner,
+                        ability_spent=False, cooldown_end=0,
+                        rev_a=i in visible_team1 or i in EVENT_STARTS[2],
+                        rev_b=i in visible_team2 or i in EVENT_STARTS[1], blocked="[]"))
+        return {"status": "created", "room_id": rid, "room_code": room.room_code,
+                "team1_players": names[:2], "team2_players": names[2:], "players": names}
+
+
+@api.get("/admin_join_test_match")
+def admin_join_test_match(room_id: str, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
+    _admin_guard(x_admin_token or admin_token)
+    import secrets
+    if not room_id.startswith("adm_test_"):
+        raise HTTPException(status_code=400, detail="only_test_rooms")
+    with MM_LOCK, room_lock(room_id), session() as db:
+        r = db.query(Room).filter(Room.room_id == room_id).first()
+        if not r:
+            return {"status": "not_found"}
+        if r.status != "WAITING" or r.guest_id:
+            return {"status": "already_joined"}
+        pid = "adm_guest_" + secrets.token_hex(8)
+        r.guest_id = pid
+        r.status = "READY"
+        r.last_seen = now()
+        if not get_match_row(db, room_id):
+            new_match(db, r)
+        return {"status": "joined", "role": "guest", "room_id": room_id, "player_id": pid}
 
 
 # старые адреса (без /api) и новые (с /api) — оба работают

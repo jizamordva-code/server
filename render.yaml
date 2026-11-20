@@ -1,0 +1,18 @@
+# Render: New + -> Blueprint -> выбрать репозиторий с этой папкой. DATABASE_URL задать вручную (строка Neon).
+services:
+  - type: web
+    name: game-server
+    runtime: python
+    plan: free
+    rootDir: server
+    buildCommand: pip install -r requirements.txt
+    startCommand: uvicorn main:app --host 0.0.0.0 --port $PORT --workers 1
+    healthCheckPath: /api/health
+    envVars:
+      - key: DATABASE_URL
+        sync: false
+      # Токен админ-панели игры (баны, удаление комнат, смена оформления). Придумайте длинный пароль.
+      - key: ADMIN_PANEL_TOKEN
+        sync: false
+      - key: PYTHON_VERSION
+        value: "3.11.9"
