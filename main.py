@@ -214,6 +214,12 @@ class EventStat(Base):  # ресурсы каждого игрока матча
     __table_args__ = (UniqueConstraint("room_id", "team", "idx", name="uq_event_stat"),)
 
 
+class EventRuntime(Base):
+    # Separate table: deployed databases need no ALTER TABLE migration.
+    __tablename__ = "event_runtime_v28"
+    room_id = Column(String(64), primary_key=True)
+    payload = Column(Text, default="{}")
+
 Base.metadata.create_all(bind=engine)
 
 # ───────────────────────────── ОБЩЕЕ ─────────────────────────────
@@ -393,9 +399,26 @@ def cell2_dict(c):
             "revealed_team2": bool(c.rev_b), "blocked_directions": json.loads(c.blocked or "[]")}
 
 
-def event_state_dict(db, em):
-    stats = (db.query(EventStat).filter(EventStat.room_id == em.room_id)
-             .order_by(EventStat.team, EventStat.idx).all())
+def _event_runtime(db, room_id):
+    row = db.get(EventRuntime, room_id)
+    if row is None:
+        row = EventRuntime(room_id=room_id, payload="{}")
+        db.add(row)
+        db.flush()
+    return row, json.loads(row.payload or "{}")
+
+
+def _event_save_runtime(row, runtime):
+    row.payload = json.dumps(runtime, separators=(",", ":"))
+
+
+def event_state_dict(db, em, runtime=None, cells=None, stats=None):
+    if runtime is None:
+        _, runtime = _event_runtime(db, em.room_id)
+    if stats is None:
+        stats = (db.query(EventStat).filter(EventStat.room_id == em.room_id)
+                 .order_by(EventStat.team, EventStat.idx).all())
+
     st = {
         "status": em.status, "winner": em.winner, "turn": em.turn, "turn_end_time": em.turn_end_time,
         "team1_glitch_until": em.team1_glitch_until, "team2_glitch_until": em.team2_glitch_until,
@@ -409,7 +432,23 @@ def event_state_dict(db, em):
         st[f"team{team}_skulls"] = [s.skulls for s in mine]
         st[f"team{team}_energy"] = [s.energy for s in mine]
         st[f"team{team}_rating"] = [s.rating for s in mine]
-    st["cells"] = [cell2_dict(c) for c in load_cells(db, "e", em.room_id)]
+    if cells is None:
+        cells = load_cells(db, "e", em.room_id)
+    actors = runtime.get("actors", {})
+    cooldowns = runtime.get("cooldowns", {})
+    reveals = runtime.get("reveals", {})
+    st["cells"] = []
+    for c in cells:
+        d = cell2_dict(c)
+        d["captured_by"] = actors.get(str(c.idx), "")
+        d["cooldown_end"] = cooldowns.get(str(c.idx), c.cooldown_end or 0)
+        d["last_ability"] = runtime.get("last_ability", {}).get(str(c.idx), {})
+        for team in (1, 2):
+            d[f"reveal_until_team{team}"] = reveals.get(str(team), {}).get(str(c.idx), 0)
+        st["cells"].append(d)
+    st["capture_counts"] = runtime.get("captures", {})
+    st["server_time"] = now()
+    st["revision"] = int(em.turn or 0)
     return st
 
 
@@ -454,6 +493,12 @@ def set_event_state(db, em, state: dict):
                     rev_b=bool(c.get("revealed_team2", False)),
                     blocked=json.dumps(c.get("blocked_directions", []))))
     db.flush()
+    row, runtime = _event_runtime(db, em.room_id)
+    for team in (1, 2):
+        names = state.get(f"team{team}_players", [])
+        for i, name in enumerate(names[:2]):
+            runtime.setdefault("actors", {})[str(EVENT_STARTS[team][i])] = name
+    _event_save_runtime(row, runtime)
 
 
 # ---- лобби ----
@@ -645,6 +690,7 @@ def remove_human(db, room, name, t):
 def delete_event_room(db, room):
     rid = room.room_id
     db.query(EventSlot).filter(EventSlot.room_id == rid).delete()
+    db.query(EventRuntime).filter(EventRuntime.room_id == rid).delete()
     db.query(EventStat).filter(EventStat.room_id == rid).delete()
     db.query(EventMatch).filter(EventMatch.room_id == rid).delete()
     delete_cells(db, "e", rid)
@@ -1717,10 +1763,40 @@ def _register_event_theft(db, room_id: str, player_id: str, stolen: int) -> None
     _ev_loss[(room_id,player_id)] += stolen
 
 
+def _event_initialize_if_ready(db, room_id):
+    room = ev_room(db, room_id)
+    if not room or room.status != "RUNNING":
+        return None
+    roster = event_roster(db, room_id)
+    if len(roster[1]) != 2 or len(roster[2]) != 2:
+        return None
+    em = ev_match(db, room_id)
+    if em and em.status != "NOT_READY":
+        return em
+    if em is None:
+        em = EventMatch(room_id=room_id, status="NOT_READY", created_at=now(), last_seen=now())
+        db.add(em)
+        db.flush()
+    pool = EVENT_CELL_TYPES * 2
+    random.shuffle(pool)
+    pool += random.choices(EVENT_CELL_TYPES, k=EVENT_CELLS-len(pool))
+    data = {"status":"RUNNING", "cells":[]}
+    for team in (1,2):
+        data[f"team{team}_players"] = [slot.name for slot in roster[team]]
+    for idx, typ in enumerate(pool):
+        owner = 1 if idx in EVENT_STARTS[1] else 2 if idx in EVENT_STARTS[2] else 0
+        data["cells"].append({"type":"yellow_two_line" if owner else typ,"owner":owner,
+                              "revealed_team1":bool(owner),"revealed_team2":bool(owner)})
+    set_event_state(db, em, data)
+    return em
+
+
 @api.get("/get_event_match")
 def get_event_match(room_id: str, player_id: str = ""):
     with room_lock(room_id), session() as db:
         em = ev_match(db, room_id)
+        if player_id and (not em or em.status == "NOT_READY"):
+            em = _event_initialize_if_ready(db, room_id) or em
         if not em:
             return {"status": "not_found"}
         t = now()
@@ -1730,7 +1806,13 @@ def get_event_match(room_id: str, player_id: str = ""):
             touch(room, t, 5.0)
         if em.status == "NOT_READY":
             return {"status": "not_ready"}
-        d = event_state_dict(db, em)
+        cells = load_cells(db, "e", room_id)
+        stats = db.query(EventStat).filter_by(room_id=room_id).order_by(EventStat.team,EventStat.idx).all()
+        row, runtime = _event_runtime(db, room_id)
+        if any(s.name == player_id for s in stats):
+            _event_tick(db, em, cells, stats, runtime, t)
+        _event_save_runtime(row, runtime)
+        d = event_state_dict(db, em, runtime, cells, stats)
         if player_id:
             d["skulls_lost"] = _ev_loss.pop((room_id, player_id), 0)
             d["theft_total"] = _event_theft_total(db,room_id,player_id)
@@ -1741,145 +1823,210 @@ def _ev_player(db, room_id, name):
     return db.query(EventStat).filter(EventStat.room_id == room_id, EventStat.name == name).first()
 
 
-@api.get("/event_capture")
-def event_capture(room_id: str, player_id: str, cell_index: int):
+def _event_cost(cells, cell, team):
+    enemy = 3 - team
+    active = lambda owner, typ: any(c.owner == owner and c.type == typ and c.ability_spent for c in cells)
+    if cell.owner == 0:
+        return 40 if active(team, "red_occupied") else 50
+    if active(enemy, "blue_light"):
+        return 100
+    return 60 if active(team, "brown_passcode") else 70
+
+
+def _event_visible(cells, cell, team, runtime, t):
+    return (cell.owner == team or any(cells[n].owner == team for n in event_neighbors(cell.idx))
+            or (cell.rev_a if team == 1 else cell.rev_b)
+            or runtime.get("reveals", {}).get(str(team), {}).get(str(cell.idx), 0) > t)
+
+
+def _event_capture_impl(db, em, cells, me, cell_index, runtime, t):
+    if em.winner or em.status != "RUNNING":
+        return {"status": "finished"}
+    if not 0 <= cell_index < len(cells):
+        return {"status": "bad_index"}
+    team, enemy = me.team, 3 - me.team
+    cell = cells[cell_index]
+    if cell.owner == team:
+        return {"status": "already_owned"}
+    if cell.owner == enemy and getattr(em, f"team{enemy}_protection_until") > t:
+        return {"status": "protected"}
+    if not any(cells[n].owner == team for n in event_neighbors(cell_index)):
+        return {"status": "not_connected"}
+    cost = _event_cost(cells, cell, team)
+    if me.skulls < cost:
+        return {"status": "no_skulls"}
+    me.skulls -= cost
+    energy_bonus = int(any(c.owner == team and c.type == "blue_hydralic" and c.ability_spent for c in cells))
+    me.energy += energy_bonus
+    me.rating += 1 if cell.owner == 0 else 2
+    cell.owner, cell.ability_spent, cell.cooldown_end = team, False, 0
+    cell.blocked = "[]"
+    runtime.setdefault("cooldowns", {}).pop(str(cell_index), None)
+    if team == 1:
+        cell.rev_a = True
+    else:
+        cell.rev_b = True
+    runtime.setdefault("actors", {})[str(cell_index)] = me.name
+    counts = runtime.setdefault("captures", {})
+    counts[me.name] = counts.get(me.name, 0) + 1
+    em.turn = int(em.turn or 0) + 1
+    if all(cells[i].owner == team for i in EVENT_STARTS[enemy]):
+        em.winner, em.status = f"team{team}", "FINISHED"
+        room = ev_room(db, em.room_id)
+        if room:
+            room.status, room.finished_at = "FINISHED", now()
+    return {"status": "ok", "cost": cost, "energy_bonus": energy_bonus}
+
+
+def _event_use_impl(db, em, cells, stats, me, cell_index, runtime, t):
+    if em.winner or em.status != "RUNNING":
+        return {"status": "finished"}
+    if not 0 <= cell_index < len(cells):
+        return {"status": "bad_index"}
+    team, enemy = me.team, 3 - me.team
+    cell = cells[cell_index]
+    typ = cell.type
+    if cell.owner != team:
+        return {"status": "not_owner"}
+    if typ not in ABILITY_STATS_2V2 or typ in ("blue_block", "brown_useless"):
+        return {"status": "no_ability"}
+    if cell.ability_spent:
+        return {"status": "already_used"}
+    if runtime.get("cooldowns", {}).get(str(cell_index), cell.cooldown_end or 0) > t:
+        return {"status": "on_cooldown"}
+    energy_cost, cooldown = ABILITY_STATS_2V2[typ]
+    if me.energy < energy_cost:
+        return {"status": "no_energy"}
+    reveal_indices = []
+    if typ == "green_vacant":
+        hidden = [c for c in cells if not _event_visible(cells, c, team, runtime, t)]
+        if not hidden:
+            return {"status": "no_hidden_cells"}
+        reveal_indices = [c.idx for c in random.sample(hidden, min(2, len(hidden)))]
+        expires = runtime.setdefault("reveals", {}).setdefault(str(team), {})
+        for idx in reveal_indices:
+            expires[str(idx)] = t + 5.0
+    elif typ == "yellow_atomic":
+        targets = [c for c in cells if c.owner == enemy and c.idx not in EVENT_STARTS[enemy]]
+        if not targets:
+            return {"status": "no_target"}
+        target = random.choice(targets)
+        target.owner, target.ability_spent, target.cooldown_end = 0, False, 0
+        runtime.setdefault("actors", {}).pop(str(target.idx), None)
+        runtime.setdefault("cooldowns", {}).pop(str(target.idx), None)
+    elif typ == "red_exit":
+        setattr(em, f"team{enemy}_hidden_until", int(t + 10))
+    elif typ == "yellow_thri_line":
+        setattr(em, f"team{enemy}_glitch_until", int(t + 5))
+    elif typ == "red_flamew":
+        setattr(em, f"team{team}_protection_until", int(t + 10))
+    me.energy -= energy_cost
+    if typ == "yellow_two_line": me.skulls += 20
+    elif typ == "brown_storage": me.energy += 10
+    elif typ == "realise":
+        me.skulls += 5
+        me.energy += 5
+    elif typ == "red_heal": me.skulls += 100
+    elif typ == "red_base": me.skulls = int(me.skulls * 1.5)
+    elif typ == "yellow_energy":
+        runtime.setdefault("passive", {}).setdefault(me.name, t + 40)
+    stolen = 0
+    if typ == "blue_gravity":
+        foes = [f for f in stats if f.team == enemy and f.skulls > 0]
+        if foes:
+            victim = max(foes, key=lambda f: f.skulls)
+            stolen = min(30, victim.skulls)
+            victim.skulls -= stolen
+            me.skulls += stolen
+            _register_event_theft(db, em.room_id, victim.name, stolen)
+    if cooldown > 0:
+        cell.cooldown_end = math.ceil(t + cooldown)
+        runtime.setdefault("cooldowns", {})[str(cell_index)] = t + cooldown
+    if cooldown == -1:
+        cell.ability_spent = True
+    em.turn = int(em.turn or 0) + 1
+    runtime.setdefault("last_ability", {})[str(cell_index)] = {"revision": em.turn, "actor": me.name, "team": team, "type": typ}
+    return {"status": "ok", "stolen": stolen, "cell_index": cell_index,
+            "cell_type": typ, "temporary_reveal_indices": reveal_indices,
+            "temporary_reveal_seconds": 5.0}
+
+
+def _event_tick(db, em, cells, stats, runtime, t):
+    if em.winner or em.status != "RUNNING" or len(cells) != EVENT_CELLS:
+        return
+    passive = runtime.setdefault("passive", {})
+    # Original seasonal yellow_energy was personal and permanent for the match.
+    for me in stats:
+        due = passive.get(me.name)
+        if due is not None and t >= due:
+            me.skulls += 20
+            passive[me.name] = t + 40
+            em.turn = int(em.turn or 0) + 1
+    if t < runtime.setdefault("next_bots", t + 1.5):
+        return
+    runtime["next_bots"] = t + 1.5
+    bots = {slot.name for slot in ev_slots(db, em.room_id) if slot.is_bot}
+    for me in stats:
+        if me.name not in bots or em.winner:
+            continue
+        team, enemy = me.team, 3 - me.team
+        candidates = [c for c in cells if c.owner != team and me.skulls >= _event_cost(cells,c,team)
+                      and any(cells[n].owner == team for n in event_neighbors(c.idx))
+                      and not (c.owner == enemy and getattr(em,f"team{enemy}_protection_until") > t)]
+        if candidates:
+            target = min(candidates, key=lambda c: min(abs(c.idx//7 - i//7) + abs(c.idx%7 - i%7) for i in EVENT_STARTS[enemy]))
+            _event_capture_impl(db, em, cells, me, target.idx, runtime, t)
+            continue
+        abilities = [c for c in cells if c.owner == team and not c.ability_spent
+                     and runtime.get("cooldowns", {}).get(str(c.idx), c.cooldown_end or 0) <= t and c.type in ABILITY_STATS_2V2
+                     and c.type not in ("blue_block", "brown_useless")
+                     and runtime.get("actors", {}).get(str(c.idx), me.name) == me.name
+                     and ABILITY_STATS_2V2[c.type][0] <= me.energy]
+        abilities.sort(key=lambda c: (c.type not in ("yellow_two_line", "realise", "red_heal", "blue_gravity", "red_base"), ABILITY_STATS_2V2[c.type][0]))
+        for c in abilities:
+            if _event_use_impl(db, em, cells, stats, me, c.idx, runtime, t)["status"] == "ok":
+                break
+
+
+def _event_action(room_id, player_id, cell_index, ability):
     with room_lock(room_id), session() as db:
         em = ev_match(db, room_id)
         if not em or em.status == "NOT_READY":
             return {"status": "no_match"}
-        me = _ev_player(db, room_id, player_id)
-        if not me:
+        stats = db.query(EventStat).filter_by(room_id=room_id).order_by(EventStat.team,EventStat.idx).all()
+        me = next((s for s in stats if s.name == player_id), None)
+        if me is None:
             return {"status": "player_not_found"}
-        if em.winner != "":
-            return {"status": "finished"}
-        if cell_index < 0 or cell_index >= EVENT_CELLS:
-            return {"status": "bad_index"}
-        team = me.team
-        enemy = 2 if team == 1 else 1
         cells = load_cells(db, "e", room_id)
-        cell = cells[cell_index]
-        if cell.owner == team:
-            return {"status": "already_owned"}
-        if getattr(em, f"team{enemy}_protection_until") > int(now()) and cell.owner == enemy:
-            return {"status": "protected"}
-        if not any(cells[n].owner == team for n in event_neighbors(cell_index)):
-            return {"status": "not_connected"}
-        cost = 50 if cell.owner == 0 else 70
-        own_cells = [c for c in cells if c.owner == team and c.ability_spent]
-        if cell.owner == 0 and any(c.type == "red_occupied" for c in own_cells):
-            cost = 40
-        if cell.owner == enemy and any(c.type == "brown_passcode" for c in own_cells):
-            cost = 60
-        if me.skulls < cost:
-            return {"status": "no_skulls"}
-        me.skulls -= cost
-        energy_bonus = 1 if any(c.owner == team and c.type == "blue_hydralic" and c.ability_spent for c in cells) else 0
-        me.energy += energy_bonus
-        me.rating += 1 if cell.owner == 0 else 2
-        cell.owner = team
-        cell.ability_spent = False
-        if team == 1:
-            cell.rev_a = True
-        else:
-            cell.rev_b = True
-        starts = EVENT_STARTS[enemy]
-        if cell_index in starts and all(cells[s].owner == team for s in starts):
-            em.winner = f"team{team}"
-            room = ev_room(db, room_id)
-            if room:
-                room.status, room.finished_at = "FINISHED", now()
-            log.info("[WIN] %s захватила обе стартовые клетки соперника", em.winner)
-        return {"status": "ok", "cost": cost, "energy_bonus": energy_bonus,
-                "resources": {"skulls": me.skulls, "energy": me.energy, "rating": me.rating}}
+        row, runtime = _event_runtime(db, room_id)
+        t = now()
+        result = (_event_use_impl(db, em, cells, stats, me, cell_index, runtime, t) if ability
+                  else _event_capture_impl(db, em, cells, me, cell_index, runtime, t))
+        _event_save_runtime(row, runtime)
+        result["resources"] = {"skulls": me.skulls, "energy": me.energy, "rating": me.rating}
+        result["state"] = event_state_dict(db, em, runtime, cells, stats)
+        result["state"]["theft_total"] = _event_theft_total(db,room_id,player_id)
+        return result
 
 
-def _apply_event_ability(db, em, cells, typ, team, enemy, t):
-    if typ == "yellow_atomic":
-        protected = EVENT_STARTS[enemy]
-        targets = [c for c in cells if c.owner == enemy and c.idx not in protected]
-        if targets:
-            random.choice(targets).owner = 0
-    elif typ == "red_exit":
-        setattr(em, f"team{enemy}_hidden_until", t + 10)
-    elif typ == "yellow_thri_line":
-        setattr(em, f"team{enemy}_glitch_until", t + 5)
-    elif typ == "red_flamew":
-        setattr(em, f"team{team}_protection_until", t + 10)
+@api.get("/event_capture")
+def event_capture(room_id: str, player_id: str, cell_index: int):
+    return _event_action(room_id, player_id, cell_index, False)
 
 
 @api.get("/event_use")
 def event_use(room_id: str, player_id: str, cell_index: int):
-    with room_lock(room_id), session() as db:
-        em = ev_match(db, room_id)
-        if not em or em.status == "NOT_READY":
-            return {"status": "no_match"}
-        me = _ev_player(db, room_id, player_id)
-        if not me:
-            return {"status": "player_not_found"}
-        if em.winner != "":
-            return {"status": "finished"}
-        if cell_index < 0 or cell_index >= EVENT_CELLS:
-            return {"status": "bad_index"}
-        team = me.team
-        enemy = 2 if team == 1 else 1
-        cells = load_cells(db, "e", room_id)
-        cell = cells[cell_index]
-        if cell.owner != team:
-            return {"status": "not_owner"}
-        if cell.ability_spent:
-            return {"status": "already_used"}
-        t = int(now())
-        if (cell.cooldown_end or 0) > t:
-            return {"status": "on_cooldown"}
-        energy_cost, cooldown = ABILITY_STATS_2V2.get(cell.type, [0, 0])
-        if me.energy < energy_cost:
-            return {"status": "no_energy"}
-        me.energy -= energy_cost
-        _apply_event_ability(db, em, cells, cell.type, team, enemy, t)
-        # Server applies resource abilities exactly once. Client must NOT resend
-        # an outdated local balance through /update_event_resources.
-        if cell.type == "yellow_two_line":
-            me.skulls += 20
-        elif cell.type == "brown_storage":
-            me.energy += 10
-        elif cell.type == "realise":
-            me.skulls += 5
-            me.energy += 5
-        elif cell.type == "red_heal":
-            me.skulls += 100
-        elif cell.type == "red_base":
-            me.skulls = int(me.skulls * 1.5)
-        stolen = 0
-        if cell.type == "blue_gravity":  # настоящая кража: 30 💀 у самого богатого противника
-            foes = [f for f in db.query(EventStat).filter(EventStat.room_id == room_id, EventStat.team == enemy).all() if f.skulls > 0]
-            if foes:
-                victim = max(foes, key=lambda f: f.skulls)
-                stolen = min(30, victim.skulls)
-                victim.skulls -= stolen
-                me.skulls += stolen
-                _register_event_theft(db,room_id,victim.name,stolen)
-        if cooldown > 0:
-            cell.cooldown_end = t + cooldown
-        if cooldown == -1:
-            cell.ability_spent = True
-        return {"status": "ok", "stolen": stolen,
-                "resources": {"skulls":me.skulls,"energy":me.energy,"rating":me.rating}}
+    return _event_action(room_id, player_id, cell_index, True)
 
 
 @api.get("/update_event_resources")
 def update_event_resources(room_id: str, player_id: str, skulls: int, energy: int, rating: int, theft_ack: int = -1):
+    # Compatibility endpoint for old clients: balances are server-owned.
     with room_lock(room_id), session() as db:
-        if not ev_match(db, room_id):
-            return {"status": "no_match"}
         me = _ev_player(db, room_id, player_id)
-        if not me:
+        if me is None:
             return {"status": "player_not_found"}
-        owed = max(0,_event_theft_total(db,room_id,player_id)-theft_ack) if theft_ack >= 0 else 0
-        me.skulls = max(0,int(skulls)-owed)
-        # Ability energy is authoritative on the server (including capture bonuses).
-        # A delayed client resource update must never overwrite it.
-        me.rating = max(0,int(rating))
-        return {"status": "ok"}
+        return {"status": "ok", "resources": {"skulls": me.skulls, "energy": me.energy, "rating": me.rating}}
 
 
 
