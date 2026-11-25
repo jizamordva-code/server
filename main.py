@@ -16,13 +16,14 @@ import asyncio
 import json
 import logging
 import math
+import hashlib
 import os
 import random
 import string
 import threading
 import time
 from collections import defaultdict
-from contextlib import asynccontextmanager, contextmanager
+from contextlib import asynccontextmanager, contextmanager, ExitStack
 
 from fastapi import APIRouter, Body, FastAPI, Header
 from fastapi.middleware.cors import CORSMiddleware
@@ -230,6 +231,7 @@ WAITING_ROOM_TTL = 60        # 1x1: комната без опроса доль�
 READY_ROOM_IDLE = 240        # 1x1: матч, в который никто не заглядывал, удаляется
 FINISHED_KEEP = 120          # завершённые матчи живут ещё столько (чтобы оба увидели победителя)
 EVENT_RUNNING_IDLE = 600     # 2x2: матч без опросов удаляется
+MATCH_HUMAN_TTL = 25        # running match: bot takes over after inactivity
 EVENT_HUMAN_TTL = 20         # 2x2 лобби: человек, не опрашивающий лобби, выпадает из комнаты
 JANITOR_INTERVAL = 30
 
@@ -241,19 +243,16 @@ FULL_ROOM_START_DELAY = 4    # если собрались 4 живых игро
 HUMAN_FILL_ORDER = [0, 2, 1, 3]       # люди расходятся по разным командам
 SLOT_TEAM = {0: 1, 1: 1, 2: 2, 3: 2}
 
-_locks = defaultdict(threading.RLock)
-_locks_guard = threading.Lock()
-MM_LOCK = threading.RLock()  # матчмейкинг (поиск/создание комнат)
-
+_locks = tuple(threading.RLock() for _ in range(128))
+MM_LOCK = threading.RLock()
+_1v1_activity = {}  # per-room, memory only; no database heartbeat writes
 
 def room_lock(key: str):
-    with _locks_guard:
-        return _locks[key]
-
+    return _locks[hash(key) % len(_locks)]
 
 def drop_lock(key: str):
-    with _locks_guard:
-        _locks.pop(key, None)
+    # Stable stripes have bounded memory and are never discarded mid-request.
+    _1v1_activity.pop(key, None)
 
 
 def now() -> float:
@@ -355,6 +354,7 @@ def delete_room(db, room):
         _pending_loss.pop(k, None)
     delete_cells(db, "m", room.room_id)
     db.query(Match).filter(Match.room_id == room.room_id).delete()
+    db.query(Kv).filter(Kv.tag.startswith("theft:" + room.room_id + ":", autoescape=True)).delete(synchronize_session=False)
     db.delete(room)
     drop_lock(room.room_id)
 
@@ -632,6 +632,8 @@ def start_event_room(db, room, t):
     for s in slots:
         if s.is_bot and s.join_at > t:
             s.join_at = t
+        elif not s.is_bot:
+            s.last_seen = t
     for sl in HUMAN_FILL_ORDER:
         if sl not in occupied:
             name = make_bot_name(taken_names)
@@ -675,7 +677,10 @@ def remove_human(db, room, name, t):
     """Игрок вышел из лобби/комнаты."""
     for s in ev_slots(db, room.room_id):
         if s.name == name and not s.is_bot:
-            db.delete(s)
+            if room.status == "RUNNING":
+                s.is_bot = True
+            elif room.status == "WAITING":
+                db.delete(s)
     db.flush()
     humans = [s for s in ev_slots(db, room.room_id) if not s.is_bot]
     if room.status == "WAITING":
@@ -691,6 +696,9 @@ def delete_event_room(db, room):
     rid = room.room_id
     db.query(EventSlot).filter(EventSlot.room_id == rid).delete()
     db.query(EventRuntime).filter(EventRuntime.room_id == rid).delete()
+    db.query(Kv).filter(Kv.tag.startswith("event_theft:" + rid + ":", autoescape=True)).delete(synchronize_session=False)
+    for key in [k for k in _ev_loss if k[0] == rid]:
+        _ev_loss.pop(key, None)
     db.query(EventStat).filter(EventStat.room_id == rid).delete()
     db.query(EventMatch).filter(EventMatch.room_id == rid).delete()
     delete_cells(db, "e", rid)
@@ -703,7 +711,7 @@ def leave_other_event_rooms(db, name, keep_room_id=None, t=None):
         if s.room_id == keep_room_id:
             continue
         r = ev_room(db, s.room_id)
-        if r and r.status == "WAITING":
+        if r and r.status in ("WAITING", "RUNNING"):
             remove_human(db, r, name, t or now())
         elif not r:
             db.delete(s)
@@ -711,12 +719,26 @@ def leave_other_event_rooms(db, name, keep_room_id=None, t=None):
 
 # ───────────────────────────── УБОРЩИК ─────────────────────────────
 
-def cleanup(db, t=None):
+def cleanup(db, t=None, held=None):
     """Единственное место, где чистятся «висячие» комнаты. Вызывается фоново и по /cleanup_old_rooms."""
     t = t or now()
     removed = {"rooms": 0, "event_rooms": 0}
 
-    for r in db.query(Room).all():
+    def claim(room_id):
+        # Do not wait for a room lock while holding a DB transaction.
+        # If an action is in flight, the next janitor pass will handle the room.
+        if held is None: return True
+        lock = room_lock(room_id)
+        if not lock.acquire(blocking=False): return False
+        held.callback(lock.release)
+        return True
+
+    for r in db.query(Room).filter(
+        ((Room.status == "WAITING") & (Room.last_seen < t-WAITING_ROOM_TTL)) |
+        ((Room.status == "READY") & (Room.last_seen < t-READY_ROOM_IDLE)) |
+        ((Room.status == "FINISHED") & (Room.last_seen < t-FINISHED_KEEP))).all():
+        if not claim(r.room_id): continue
+        db.refresh(r)
         dead = False
         if r.status == "WAITING" and t - (r.last_seen or 0) > WAITING_ROOM_TTL:
             dead = True
@@ -727,13 +749,17 @@ def cleanup(db, t=None):
         if dead:
             delete_room(db, r)
             removed["rooms"] += 1
-    live = {r.room_id for r in db.query(Room).all()}
-    for m in db.query(Match).all():  # матчи-сироты
-        if m.room_id not in live:
-            delete_cells(db, "m", m.room_id)
-            db.delete(m)
+    for m in db.query(Match).filter(~Match.room_id.in_(db.query(Room.room_id))).all():
+        if not claim(m.room_id): continue
+        delete_cells(db, "m", m.room_id)
+        db.delete(m)
 
-    for r in db.query(EventRoom).all():
+    for r in db.query(EventRoom).filter(
+        (EventRoom.status == "WAITING") |
+        ((EventRoom.status == "RUNNING") & (EventRoom.last_seen < t-EVENT_RUNNING_IDLE)) |
+        ((EventRoom.status == "FINISHED") & (EventRoom.finished_at < t-FINISHED_KEEP))).all():
+        if not claim(r.room_id): continue
+        db.refresh(r)
         dead = False
         if r.status == "WAITING":
             purge_silent_humans(db, r, t)
@@ -746,12 +772,12 @@ def cleanup(db, t=None):
         if dead:
             delete_event_room(db, r)
             removed["event_rooms"] += 1
-    live_ev = {r.room_id for r in db.query(EventRoom).all()}
-    for m in db.query(EventMatch).all():  # матч создаётся раньше/без комнаты — даём час
-        if m.room_id not in live_ev and t - (m.last_seen or 0) > 3600:
-            db.query(EventStat).filter(EventStat.room_id == m.room_id).delete()
-            delete_cells(db, "e", m.room_id)
-            db.delete(m)
+    for m in db.query(EventMatch).filter(~EventMatch.room_id.in_(db.query(EventRoom.room_id)), EventMatch.last_seen < t-3600).all():
+        if not claim(m.room_id): continue
+        db.query(EventStat).filter(EventStat.room_id == m.room_id).delete()
+        db.query(EventRuntime).filter(EventRuntime.room_id == m.room_id).delete()
+        delete_cells(db, "e", m.room_id)
+        db.delete(m)
 
     with _relay_lock:
         for k in [k for k, (ts, _s) in _relay.items() if t - ts > 600]:
@@ -760,8 +786,8 @@ def cleanup(db, t=None):
 
 
 def run_cleanup():
-    with MM_LOCK, session() as db:
-        res = cleanup(db)
+    with MM_LOCK, ExitStack() as held, session() as db:
+        res = cleanup(db, held=held)
     if res["rooms"] or res["event_rooms"]:
         log.info("cleanup: %s", res)
     return res
@@ -1000,7 +1026,7 @@ def admin_set_ban(player_id: str, banned: bool = True, admin_token: str = "", x_
 @api.get("/admin_delete_room")
 def admin_delete_room(room_id: str, admin_token: str = "", x_admin_token: str = Header(default="", alias="X-Admin-Token")):
     _admin_guard(x_admin_token or admin_token)
-    with MM_LOCK, session() as db:
+    with MM_LOCK, room_lock(room_id), session() as db:
         r = db.query(Room).filter(Room.room_id == room_id).first()
         if r:
             delete_room(db, r)
@@ -1058,6 +1084,38 @@ def update_score(player_id: str, add_score: int):
     return {"status": "updated", "total_ex": total}
 
 
+@api.get("/sync_score")
+def sync_score(player_id: str, local_rating: int, spend: int = 0, earn: int = 0, operation_id: str = ""):
+    """One lobby round-trip: legacy max merge + durable local gains/spends.
+    The last pending operation receipt makes retries after a lost response safe.
+    """
+    spend, earn = max(0, spend), max(0, earn)
+    with session() as db:
+        ensure_player(db, player_id)
+        p = db.query(Player).filter_by(player_id=player_id).with_for_update().one()
+        receipt = None
+        if spend or earn:
+            if not operation_id:
+                return {"status": "missing_operation"}
+            tag = "wallet_sync:" + hashlib.sha256(player_id.encode()).hexdigest()
+            receipt = db.get(Kv, tag)
+            if receipt:
+                previous = json.loads(receipt.value)
+                if previous.get("id") == operation_id:
+                    return {"status": "updated", "total_ex": previous["total_ex"]}
+        base = max(0, local_rating + spend - earn)
+        total = max(0, max(int(p.total_ex or 0), base) + earn - spend)
+        if total != p.total_ex:
+            p.total_ex = total
+        if spend or earn:
+            if receipt is None:
+                receipt = Kv(tag=tag)
+                db.add(receipt)
+            receipt.value = json.dumps({"id": operation_id, "total_ex": total})
+            receipt.updated_at = now()
+        return {"status": "updated", "total_ex": total}
+
+
 @api.get("/store_data")
 def store_data(tag: str, value: str):
     """Магазин присылает tag = "ex_<имя>-<device_id>" и новое значение рейтинга."""
@@ -1107,7 +1165,7 @@ def get_rating_100():
 def _abandon_old_rooms(db, player_id, t):
     """Игрок ищет новую игру — его старые комнаты больше никому не нужны."""
     for r in db.query(Room).filter((Room.host_id == player_id) | (Room.guest_id == player_id)).all():
-        if r.status == "WAITING" or r.status == "READY":
+        if r.status == "WAITING":
             delete_room(db, r)
 
 
@@ -1129,9 +1187,7 @@ def find_or_create_room(player_id: str):
             own.last_seen = t
             return {"status": "created", "role": "host", "room_id": own.room_id}
 
-        for r in db.query(Room).filter((Room.host_id == player_id) | (Room.guest_id == player_id)).all():
-            if r.status == "READY":
-                delete_room(db, r)  # прошлая незавершённая партия брошена
+        # Old running rooms are retained; their remaining player gets a bot.
         db.flush()
 
         waiting = (db.query(Room)
@@ -1155,9 +1211,9 @@ def find_or_create_room(player_id: str):
 
 @api.get("/cancel_room")
 def cancel_room(room_id: str):
-    with session() as db:
+    with room_lock(room_id), session() as db:
         room = db.query(Room).filter(Room.room_id == room_id).first()
-        if room:
+        if room and room.status == "WAITING":
             delete_room(db, room)
     return {"status": "cancelled"}
 
@@ -1176,10 +1232,9 @@ def leave_room(room_id: str, player_id: str = ""):
             room.status = "FINISHED"  # соперник ещё может дочитать итог; уберёт уборщик
             room.last_seen = now()
         elif player_id and m and player_id in (m.host_id, m.guest_id):
-            # ушёл посреди партии — техническое поражение
-            m.winner = m.guest_id if player_id == m.host_id else m.host_id
-            room.status = "FINISHED"
-            room.last_seen = now()
+            activity = _1v1_activity.setdefault(room_id, {"seen": {}, "bots": set(), "next": {}})
+            activity["bots"].add(player_id)
+            activity["next"][player_id] = now() + 3.0
         return {"status": "left"}
 
 
@@ -1225,12 +1280,78 @@ def _register_theft(db, room_id: str, victim_id: str, amount: int) -> None:
     _pending_loss[(room_id, victim_id)] += amount
 
 
+def _1v1_tick(db, m, cells, player_id, t):
+    if m.winner or player_id not in (m.host_id, m.guest_id):
+        return
+    rt = _1v1_activity.setdefault(m.room_id, {"seen": {}, "bots": set(), "next": {}})
+    for name in (m.host_id, m.guest_id):
+        rt["seen"].setdefault(name, t)
+    if player_id in rt["bots"]:
+        return
+    rt["seen"][player_id] = t
+    opponent = m.guest_id if player_id == m.host_id else m.host_id
+    if opponent not in rt["bots"] and t - rt["seen"][opponent] > MATCH_HUMAN_TTL:
+        rt["bots"].add(opponent)
+        rt["next"][opponent] = t + 3.0
+    if opponent not in rt["bots"] or t < rt["next"].get(opponent, 0):
+        return
+    rt["next"][opponent] = t + random.uniform(4.0, 7.0)
+    host = opponent == m.host_id
+    team = 1 if host else 2
+    prefix = "host_" if host else "guest_"
+    if m.status == ("HOST_PICK" if host else "GUEST_PICK"):
+        available = [c.idx for c in cells if c.idx != m.host_start]
+        _1v1_pick_start(db, m, cells, m.room_id, opponent, random.choice(available))
+        return
+    if m.status != "RUNNING":
+        return
+    skulls, energy = getattr(m, prefix+"skulls"), getattr(m, prefix+"energy")
+    passive = rt.setdefault("passive", {})
+    if any(c.owner == team and c.type == "yellow_energy" and c.ability_spent for c in cells):
+        if t >= passive.setdefault(opponent, t + 40):
+            skulls += 20
+            setattr(m, prefix+"skulls", skulls)
+            passive[opponent] = t + 40
+    else:
+        passive.pop(opponent, None)
+    def cost(c):
+        spent = lambda side, typ: any(x.owner == side and x.type == typ and x.ability_spent for x in cells)
+        if c.owner == 0: return 40 if spent(team,"red_occupied") else 50
+        return 100 if spent(3-team,"blue_light") else 50 if spent(team,"brown_passcode") else 70
+    candidates = [c for c in cells if c.owner != team and skulls >= cost(c)
+                  and any(cells[n].owner == team for n in get_neighbors(c.idx))]
+    if candidates and (random.random() < 0.65 or skulls >= 140):
+        random.shuffle(candidates)
+        for c in candidates:
+            result = _1v1_capture_cell(db, m, cells, m.room_id, opponent, c.idx)
+            if result["status"] == "ok":
+                setattr(m,prefix+"skulls",max(0,skulls-result["cost"]))
+                setattr(m,prefix+"energy",energy+result["energy_bonus"])
+                return
+    abilities = [c for c in cells if c.owner == team and not c.ability_spent
+                 and (c.cooldown_end or 0) <= t and c.type in ABILITY_STATS_2V2
+                 and ABILITY_STATS_2V2[c.type][0] <= energy]
+    random.shuffle(abilities)
+    abilities.sort(key=lambda c: 0 if c.type in ("yellow_two_line","realise","red_heal","red_base") and skulls < 80 else 1)
+    for c in abilities:
+        result = _1v1_use_cell(db,m,cells,m.room_id,opponent,c.idx)
+        if result["status"] != "ok": continue
+        setattr(m,prefix+"energy",energy-ABILITY_STATS_2V2[c.type][0]+(10 if c.type=="brown_storage" else 5 if c.type=="realise" else 0))
+        if c.type == "yellow_two_line": setattr(m,prefix+"skulls",skulls+20)
+        elif c.type == "realise": setattr(m,prefix+"skulls",skulls+5)
+        elif c.type == "red_heal": setattr(m,prefix+"skulls",skulls+100)
+        elif c.type == "red_base": setattr(m,prefix+"skulls",int(skulls*1.5))
+        return
+
+
 @api.get("/get_match")
 def get_match(room_id: str, player_id: str = "", skulls: int = -1, energy: int = -1, theft_ack: int = -1):
     with room_lock(room_id), session() as db:
         m = get_match_row(db, room_id)
         if not m:
             return {"status": "not_found"}
+        if player_id and player_id in _1v1_activity.get(room_id, {}).get("bots", set()):
+            return {"status": "player_left"}
         room = db.query(Room).filter(Room.room_id == room_id).first()
         if room:
             touch(room)
@@ -1241,12 +1362,15 @@ def get_match(room_id: str, player_id: str = "", skulls: int = -1, energy: int =
         # Legacy clients have no ack; apply and consume only the first pending loss.
         pending_legacy = _pending_loss.pop((room_id,player_id),0) if theft_ack < 0 and player_id else 0
         unacked = max(0, victim_total - max(theft_ack,0)) if theft_ack >= 0 else pending_legacy
-        if player_id and skulls >= 0:
+        if player_id and skulls >= 0 and player_id not in _1v1_activity.get(room_id, {}).get("bots", set()):
             if player_id == m.host_id:
                 m.host_skulls, m.host_energy = max(0,skulls-unacked), max(0, energy)
             elif player_id == m.guest_id:
                 m.guest_skulls, m.guest_energy = max(0,skulls-unacked), max(0, energy)
-        d = match_dict(m, load_cells(db, "m", room_id))
+        cells = load_cells(db, "m", room_id)
+        _1v1_tick(db, m, cells, player_id, now())
+        _reward_match(db, m)
+        d = match_dict(m, cells)
         d["theft_total"] = victim_total
         d["skulls_lost"] = unacked
         d["server_time"] = now()  # клиент выравнивает свои часы по серверным (для таймеров дебаффов)
@@ -1259,110 +1383,121 @@ def pick_start(room_id: str, player_id: str, cell_index: int):
         return {"status": "bad_index"}
     with room_lock(room_id), session() as db:
         m = get_match_row(db, room_id)
-        if not m:
-            return {"status": "not_found"}
-        cells = load_cells(db, "m", room_id)
+        if player_id in _1v1_activity.get(room_id, {}).get("bots", set()):
+            return {"status": "player_left"}
+        return _1v1_pick_start(db, m, load_cells(db, "m", room_id), room_id, player_id, cell_index)
 
-        if m.status == "HOST_PICK":
-            if player_id != m.host_id:
-                return {"status": "wait_host"}
-            m.host_start = cell_index
-            m.status = "GUEST_PICK"
-            return {"status": "ok"}
 
-        if m.status == "GUEST_PICK":
-            if player_id != m.guest_id:
-                return {"status": "wait_guest"}
-            if cell_index == m.host_start:
-                m.host_start = m.guest_start = -1
-                m.status = "HOST_PICK"
-                return {"status": "same_cell"}
-            m.guest_start = cell_index
-            hs, gs = m.host_start, m.guest_start
-            cells[hs].owner, cells[hs].type = 1, "yellow_two_line"
-            cells[gs].owner, cells[gs].type = 2, "yellow_two_line"
-            host_nb = [n for n in get_neighbors(hs) if n != gs and cells[n].owner == 0]
-            guest_nb = [n for n in get_neighbors(gs) if n != hs and cells[n].owner == 0]
-            for n in host_nb:
-                cells[n].rev_a = True
-            for n in guest_nb:
-                cells[n].rev_b = True
-            host_storage = random.choice(host_nb) if host_nb else -1
-            if host_storage >= 0:
-                cells[host_storage].type = "brown_storage"
-            avail = [n for n in guest_nb if n != host_storage]
-            if avail:
-                cells[random.choice(avail)].type = "brown_storage"
-            m.status = "RUNNING"
-            return {"status": "started"}
-        return {"status": "already_running"}
+def _1v1_pick_start(db, m, cells, room_id, player_id, cell_index):
+    if not m:
+        return {"status": "not_found"}
+
+    if m.status == "HOST_PICK":
+        if player_id != m.host_id:
+            return {"status": "wait_host"}
+        m.host_start = cell_index
+        m.status = "GUEST_PICK"
+        return {"status": "ok"}
+
+    if m.status == "GUEST_PICK":
+        if player_id != m.guest_id:
+            return {"status": "wait_guest"}
+        if cell_index == m.host_start:
+            m.host_start = m.guest_start = -1
+            m.status = "HOST_PICK"
+            return {"status": "same_cell"}
+        m.guest_start = cell_index
+        hs, gs = m.host_start, m.guest_start
+        cells[hs].owner, cells[hs].type = 1, "yellow_two_line"
+        cells[gs].owner, cells[gs].type = 2, "yellow_two_line"
+        host_nb = [n for n in get_neighbors(hs) if n != gs and cells[n].owner == 0]
+        guest_nb = [n for n in get_neighbors(gs) if n != hs and cells[n].owner == 0]
+        for n in host_nb:
+            cells[n].rev_a = True
+        for n in guest_nb:
+            cells[n].rev_b = True
+        host_storage = random.choice(host_nb) if host_nb else -1
+        if host_storage >= 0:
+            cells[host_storage].type = "brown_storage"
+        avail = [n for n in guest_nb if n != host_storage]
+        if avail:
+            cells[random.choice(avail)].type = "brown_storage"
+        m.status = "RUNNING"
+        return {"status": "started"}
+    return {"status": "already_running"}
 
 
 @api.get("/capture_cell")
 def capture_cell(room_id: str, player_id: str, cell_index: int):
     with room_lock(room_id), session() as db:
         m = get_match_row(db, room_id)
-        if not m:
-            return {"status": "no_match"}
-        if m.winner != "":
-            return {"status": "finished"}
-        if cell_index < 0 or cell_index >= 25:
-            return {"status": "bad_index"}
-        if player_id not in (m.host_id, m.guest_id):
-            return {"status": "not_in_match"}
-        cells = load_cells(db, "m", room_id)
-        is_host = player_id == m.host_id
-        my, enemy = (1, 2) if is_host else (2, 1)
-        cell = cells[cell_index]
-        enemy_start = m.guest_start if is_host else m.host_start
+        if player_id in _1v1_activity.get(room_id, {}).get("bots", set()):
+            return {"status": "player_left"}
+        return _1v1_capture_cell(db, m, load_cells(db, "m", room_id), room_id, player_id, cell_index)
 
-        if cell.owner == my:
-            return {"status": "already_owned"}
-        # защита (red_flamew) принадлежит владельцу клетки: враг её защитил — нельзя
-        enemy_protection = m.guest_protection_until if is_host else m.host_protection_until
-        if cell.owner == enemy and enemy_protection > int(now()):
-            return {"status": "protected"}
-        if not any(cells[n].owner == my for n in get_neighbors(cell_index)):
-            return {"status": "not_connected"}
 
-        # стоимость (клиент списывает сам, сервер только сообщает)
-        cost = 50 if cell.owner == 0 else 70
-        mine_spent = lambda typ: any(c.owner == my and c.type == typ and c.ability_spent for c in cells)  # noqa: E731
-        enemy_spent = lambda typ: any(c.owner == enemy and c.type == typ and c.ability_spent for c in cells)  # noqa: E731
-        if cell.owner == 0 and mine_spent("red_occupied"):
-            cost = 40
-        if cell.owner == enemy:
-            if mine_spent("brown_passcode"):
-                cost = 50
-            if enemy_spent("blue_light"):
-                cost = 100  # у владельца включён blue_light — отбить клетку дороже
+def _1v1_capture_cell(db, m, cells, room_id, player_id, cell_index):
+    if not m:
+        return {"status": "no_match"}
+    if m.winner != "":
+        return {"status": "finished"}
+    if cell_index < 0 or cell_index >= 25:
+        return {"status": "bad_index"}
+    if player_id not in (m.host_id, m.guest_id):
+        return {"status": "not_in_match"}
+    is_host = player_id == m.host_id
+    my, enemy = (1, 2) if is_host else (2, 1)
+    cell = cells[cell_index]
+    enemy_start = m.guest_start if is_host else m.host_start
 
-        # blue_hydralic is a one-time passive: every later capture gives +1 energy
-        # while at least one activated blue_hydralic tile remains under this player's control.
-        energy_bonus = 1 if mine_spent("blue_hydralic") else 0
-        gain = 1 if cell.owner == 0 else 2
-        if is_host:
-            m.host_rating += gain
-        else:
-            m.guest_rating += gain
-        cell.owner = my
-        cell.ability_spent = False
-        cell.cooldown_end = 0
-        cell.blocked = "[]"
-        if is_host:
-            cell.rev_a = True
-        else:
-            cell.rev_b = True
-        if cell_index == enemy_start:
-            m.winner = player_id
-        room = db.query(Room).filter(Room.room_id == room_id).first()
-        if room:
-            room.last_seen = now()
-            if m.winner:
-                room.status = "FINISHED"
-        return {"status": "ok", "cost": cost, "energy_bonus": energy_bonus, "winner": m.winner,
-                "rating": m.host_rating if is_host else m.guest_rating,
-                "state": match_dict(m, cells)}
+    if cell.owner == my:
+        return {"status": "already_owned"}
+    # защита (red_flamew) принадлежит владельцу клетки: враг её защитил — нельзя
+    enemy_protection = m.guest_protection_until if is_host else m.host_protection_until
+    if cell.owner == enemy and enemy_protection > int(now()):
+        return {"status": "protected"}
+    if not any(cells[n].owner == my for n in get_neighbors(cell_index)):
+        return {"status": "not_connected"}
+
+    # стоимость (клиент списывает сам, сервер только сообщает)
+    cost = 50 if cell.owner == 0 else 70
+    mine_spent = lambda typ: any(c.owner == my and c.type == typ and c.ability_spent for c in cells)  # noqa: E731
+    enemy_spent = lambda typ: any(c.owner == enemy and c.type == typ and c.ability_spent for c in cells)  # noqa: E731
+    if cell.owner == 0 and mine_spent("red_occupied"):
+        cost = 40
+    if cell.owner == enemy:
+        if mine_spent("brown_passcode"):
+            cost = 50
+        if enemy_spent("blue_light"):
+            cost = 100  # у владельца включён blue_light — отбить клетку дороже
+
+    # blue_hydralic is a one-time passive: every later capture gives +1 energy
+    # while at least one activated blue_hydralic tile remains under this player's control.
+    energy_bonus = 1 if mine_spent("blue_hydralic") else 0
+    gain = 1 if cell.owner == 0 else 2
+    if is_host:
+        m.host_rating += gain
+    else:
+        m.guest_rating += gain
+    cell.owner = my
+    cell.ability_spent = False
+    cell.cooldown_end = 0
+    cell.blocked = "[]"
+    if is_host:
+        cell.rev_a = True
+    else:
+        cell.rev_b = True
+    if cell_index == enemy_start:
+        m.winner = player_id
+        _reward_match(db, m)
+    room = db.query(Room).filter(Room.room_id == room_id).first()
+    if room:
+        room.last_seen = now()
+        if m.winner:
+            room.status = "FINISHED"
+    return {"status": "ok", "cost": cost, "energy_bonus": energy_bonus, "winner": m.winner,
+            "rating": m.host_rating if is_host else m.guest_rating,
+            "state": match_dict(m, cells)}
 
 
 def _enemy_cells(cells, enemy, m):
@@ -1373,73 +1508,78 @@ def _enemy_cells(cells, enemy, m):
 def use_cell(room_id: str, player_id: str, cell_index: int):
     with room_lock(room_id), session() as db:
         m = get_match_row(db, room_id)
-        if not m:
-            return {"status": "no_match"}
-        if m.winner != "":
-            return {"status": "finished"}
-        if cell_index < 0 or cell_index >= 25:
-            return {"status": "bad_index"}
-        cells = load_cells(db, "m", room_id)
-        is_host = player_id == m.host_id
-        my, enemy = (1, 2) if is_host else (2, 1)
-        cell = cells[cell_index]
-        if cell.owner != my:
-            return {"status": "not_owner"}
-        typ, t = cell.type, int(now())
+        if player_id in _1v1_activity.get(room_id, {}).get("bots", set()):
+            return {"status": "player_left"}
+        return _1v1_use_cell(db, m, load_cells(db, "m", room_id), room_id, player_id, cell_index)
 
-        if player_id not in (m.host_id,m.guest_id):
-            return {"status": "not_in_match"}
-        if (cell.cooldown_end or 0) > t and cell.blocked == typ:
-            return {"status": "on_cooldown"}
-        if typ in PERMANENT_TYPES:  # разовая клетка: повторно нельзя, пока её не отобрал соперник
-            if cell.ability_spent:
-                return {"status": "already_used"}
-            cell.ability_spent = True
 
-        temporary_reveal_indices = []
-        if typ == "yellow_atomic":
-            targets = _enemy_cells(cells, enemy, m)
-            if targets:
-                cells[random.choice(targets)].owner = 0
-        elif typ == "green_vacant":
-            # Only temporary previews; never alter rev_a/rev_b permanently.
-            hidden = [c for c in cells if c.owner == 0 and c.idx != cell_index]
-            random.shuffle(hidden)
-            temporary_reveal_indices = [c.idx for c in hidden[:2]]
-        elif typ == "red_exit":
-            if is_host:
-                m.guest_hidden_until = t + 10
-            else:
-                m.host_hidden_until = t + 10
-        elif typ == "yellow_thri_line":
-            if is_host:
-                m.guest_glitch_until = t + 5
-            else:
-                m.host_glitch_until = t + 5
-        elif typ == "red_flamew":
-            if is_host:
-                m.host_protection_until = t + 10
-            else:
-                m.guest_protection_until = t + 10
-        stolen = 0
-        if typ == "blue_gravity":
-            victim_id = m.guest_id if is_host else m.host_id
-            balance_attr = "guest_skulls" if is_host else "host_skulls"
-            mine_attr = "host_skulls" if is_host else "guest_skulls"
-            stolen = min(30,max(0,int(getattr(m,balance_attr) or 0)))
-            setattr(m,balance_attr,int(getattr(m,balance_attr))-stolen)
-            setattr(m,mine_attr,int(getattr(m,mine_attr))+stolen)
-            _register_theft(db,room_id,victim_id,stolen)
-        cooldown = {"blue_gravity":15,"red_flamew":20,"red_exit":6,"yellow_thri_line":10,"yellow_atomic":20,
-                    "green_vacant":5,"yellow_two_line":5,"brown_storage":5,"realise":5,
-                    "red_heal":10,"red_base":20}.get(typ,0)
-        if cooldown > 0:
-            cell.cooldown_end = t + cooldown
-            cell.blocked = typ
-        return {"status": "ok", "cell_type": typ, "stolen": stolen,
-                "temporary_reveal_indices": temporary_reveal_indices,
-                "temporary_reveal_seconds": 5.0,
-                "state": match_dict(m, cells)}
+def _1v1_use_cell(db, m, cells, room_id, player_id, cell_index):
+    if not m:
+        return {"status": "no_match"}
+    if m.winner != "":
+        return {"status": "finished"}
+    if cell_index < 0 or cell_index >= 25:
+        return {"status": "bad_index"}
+    is_host = player_id == m.host_id
+    my, enemy = (1, 2) if is_host else (2, 1)
+    cell = cells[cell_index]
+    if cell.owner != my:
+        return {"status": "not_owner"}
+    typ, t = cell.type, int(now())
+
+    if player_id not in (m.host_id,m.guest_id):
+        return {"status": "not_in_match"}
+    if (cell.cooldown_end or 0) > t and cell.blocked == typ:
+        return {"status": "on_cooldown"}
+    if typ in PERMANENT_TYPES:  # разовая клетка: повторно нельзя, пока её не отобрал соперник
+        if cell.ability_spent:
+            return {"status": "already_used"}
+        cell.ability_spent = True
+
+    temporary_reveal_indices = []
+    if typ == "yellow_atomic":
+        targets = _enemy_cells(cells, enemy, m)
+        if targets:
+            cells[random.choice(targets)].owner = 0
+    elif typ == "green_vacant":
+        # Only temporary previews; never alter rev_a/rev_b permanently.
+        hidden = [c for c in cells if c.owner == 0 and c.idx != cell_index]
+        random.shuffle(hidden)
+        temporary_reveal_indices = [c.idx for c in hidden[:2]]
+    elif typ == "red_exit":
+        if is_host:
+            m.guest_hidden_until = t + 10
+        else:
+            m.host_hidden_until = t + 10
+    elif typ == "yellow_thri_line":
+        if is_host:
+            m.guest_glitch_until = t + 5
+        else:
+            m.host_glitch_until = t + 5
+    elif typ == "red_flamew":
+        if is_host:
+            m.host_protection_until = t + 10
+        else:
+            m.guest_protection_until = t + 10
+    stolen = 0
+    if typ == "blue_gravity":
+        victim_id = m.guest_id if is_host else m.host_id
+        balance_attr = "guest_skulls" if is_host else "host_skulls"
+        mine_attr = "host_skulls" if is_host else "guest_skulls"
+        stolen = min(30,max(0,int(getattr(m,balance_attr) or 0)))
+        setattr(m,balance_attr,int(getattr(m,balance_attr))-stolen)
+        setattr(m,mine_attr,int(getattr(m,mine_attr))+stolen)
+        _register_theft(db,room_id,victim_id,stolen)
+    cooldown = {"blue_gravity":15,"red_flamew":20,"red_exit":6,"yellow_thri_line":10,"yellow_atomic":20,
+                "green_vacant":5,"yellow_two_line":5,"brown_storage":5,"realise":5,
+                "red_heal":10,"red_base":20}.get(typ,0)
+    if cooldown > 0:
+        cell.cooldown_end = t + cooldown
+        cell.blocked = typ
+    return {"status": "ok", "cell_type": typ, "stolen": stolen,
+            "temporary_reveal_indices": temporary_reveal_indices,
+            "temporary_reveal_seconds": 5.0,
+            "state": match_dict(m, cells)}
 
 
 @api.get("/atomic_strike")
@@ -1511,6 +1651,17 @@ def steal_skulls(room_id: str, player_id: str, amount: int):
         return {"status": "ok", "stolen": stolen}
 
 
+def _reward_match(db, m):
+    if not m.winner or m.rewarded:
+        return
+    if m.winner not in _1v1_activity.get(m.room_id, {}).get("bots", set()):
+        rating = m.host_rating if m.winner == m.host_id else m.guest_rating
+        ensure_player(db, m.winner)
+        db.execute(update(Player).where(Player.player_id == m.winner)
+                   .values(total_ex=Player.total_ex + int(rating or 0)))
+    m.rewarded = True
+
+
 @api.get("/finish_match")
 def finish_match(room_id: str):
     """Начислить рейтинг победителю (один раз!). Матч остаётся на пару минут — второй игрок увидит итог."""
@@ -1520,11 +1671,7 @@ def finish_match(room_id: str):
             return {"status": "no_match"}
         if m.winner == "":
             return {"status": "no_winner"}
-        if not m.rewarded:
-            rating = m.host_rating if m.winner == m.host_id else m.guest_rating
-            p = ensure_player(db, m.winner)
-            p.total_ex = (p.total_ex or 0) + rating
-            m.rewarded = True
+        _reward_match(db, m)
         room = db.query(Room).filter(Room.room_id == room_id).first()
         if room:
             room.status = "FINISHED"
@@ -1668,7 +1815,7 @@ def event_lobby(room_id: str, player_id: str = ""):
 
 @api.get("/leave_event_room")
 def leave_event_room(room_id: str, player_id: str):
-    with MM_LOCK, session() as db:
+    with MM_LOCK, room_lock(room_id), session() as db:
         room = ev_room(db, room_id)
         if not room:
             return {"status": "left"}
@@ -1678,7 +1825,7 @@ def leave_event_room(room_id: str, player_id: str):
 @api.get("/cancel_event_room")
 def cancel_event_room(room_id: str, player_id: str = ""):
     """С player_id — выход игрока. Без него (так зовёт игровой код) — закрыть, но не рубить чужую партию."""
-    with MM_LOCK, session() as db:
+    with MM_LOCK, room_lock(room_id), session() as db:
         room = ev_room(db, room_id)
         if not room:
             return {"status": "cancelled"}
@@ -1733,6 +1880,8 @@ def update_event_match(room_id: str, state: dict = Body(...)):
         # The host may only upload the initial map. A delayed or repeated POST
         # must never destroy the authoritative in-progress cells and balances.
         if em.status != "NOT_READY":
+            return {"status": "already_initialized"}
+        if _event_initialize_if_ready(db, room_id):
             return {"status": "already_initialized"}
         cells_payload = state.get("cells", [])
         if not isinstance(cells_payload, list) or len(cells_payload) != EVENT_CELLS:
@@ -1809,8 +1958,19 @@ def get_event_match(room_id: str, player_id: str = ""):
         cells = load_cells(db, "e", room_id)
         stats = db.query(EventStat).filter_by(room_id=room_id).order_by(EventStat.team,EventStat.idx).all()
         row, runtime = _event_runtime(db, room_id)
-        if any(s.name == player_id for s in stats):
-            _event_tick(db, em, cells, stats, runtime, t)
+        if player_id:
+            slots = ev_slots(db, room_id)
+            me = next((slot for slot in slots if slot.name == player_id), None)
+            if me and me.is_bot:
+                return {"status": "player_left"}
+            if em.status == "RUNNING" and me:
+                touch(me, t, 5.0)
+                for slot in slots:
+                    if not slot.is_bot and slot.name != player_id and t - (slot.last_seen or t) > MATCH_HUMAN_TTL:
+                        slot.is_bot = True
+                _event_tick(db, em, cells, stats, runtime, t, slots)
+            elif em.status == "RUNNING" and me is None and any(s.name == player_id for s in stats):
+                _event_tick(db, em, cells, stats, runtime, t, slots)
         _event_save_runtime(row, runtime)
         d = event_state_dict(db, em, runtime, cells, stats)
         if player_id:
@@ -1951,7 +2111,7 @@ def _event_use_impl(db, em, cells, stats, me, cell_index, runtime, t):
             "temporary_reveal_seconds": 5.0}
 
 
-def _event_tick(db, em, cells, stats, runtime, t):
+def _event_tick(db, em, cells, stats, runtime, t, slots=None):
     if em.winner or em.status != "RUNNING" or len(cells) != EVENT_CELLS:
         return
     passive = runtime.setdefault("passive", {})
@@ -1962,30 +2122,40 @@ def _event_tick(db, em, cells, stats, runtime, t):
             me.skulls += 20
             passive[me.name] = t + 40
             em.turn = int(em.turn or 0) + 1
-    if t < runtime.setdefault("next_bots", t + 1.5):
+    slots = ev_slots(db, em.room_id) if slots is None else slots
+    bots = {slot.name for slot in slots if slot.is_bot}
+    if not bots or t < runtime.setdefault("next_bots", t + 3.0):
         return
     runtime["next_bots"] = t + 1.5
-    bots = {slot.name for slot in ev_slots(db, em.room_id) if slot.is_bot}
-    for me in stats:
-        if me.name not in bots or em.winner:
-            continue
+    schedule = runtime.setdefault("bot_next", {})
+    ready = [me for me in stats if me.name in bots and t >= schedule.setdefault(me.name, t + random.uniform(2.0, 5.0))]
+    random.shuffle(ready)
+    for me in ready:
+        schedule[me.name] = t + random.uniform(4.0, 7.5)
         team, enemy = me.team, 3 - me.team
         candidates = [c for c in cells if c.owner != team and me.skulls >= _event_cost(cells,c,team)
                       and any(cells[n].owner == team for n in event_neighbors(c.idx))
                       and not (c.owner == enemy and getattr(em,f"team{enemy}_protection_until") > t)]
-        if candidates:
-            target = min(candidates, key=lambda c: min(abs(c.idx//7 - i//7) + abs(c.idx%7 - i%7) for i in EVENT_STARTS[enemy]))
-            _event_capture_impl(db, em, cells, me, target.idx, runtime, t)
-            continue
         abilities = [c for c in cells if c.owner == team and not c.ability_spent
                      and runtime.get("cooldowns", {}).get(str(c.idx), c.cooldown_end or 0) <= t and c.type in ABILITY_STATS_2V2
                      and c.type not in ("blue_block", "brown_useless")
                      and runtime.get("actors", {}).get(str(c.idx), me.name) == me.name
                      and ABILITY_STATS_2V2[c.type][0] <= me.energy]
-        abilities.sort(key=lambda c: (c.type not in ("yellow_two_line", "realise", "red_heal", "blue_gravity", "red_base"), ABILITY_STATS_2V2[c.type][0]))
+        # Alternate expansion and replenishing resources; sometimes use defensive/support effects.
+        def priority(c):
+            return ((3 if c.type in ("yellow_two_line", "realise", "red_heal", "red_base") and me.skulls < 85 else 0)
+                    + (3 if c.type == "brown_storage" and me.energy < 35 else 0)
+                    + (2 if c.type in ("blue_gravity", "yellow_energy", "red_flamew") else 0)
+                    + random.random()*2)
+        abilities.sort(key=priority, reverse=True)
+        if candidates and (not abilities or random.random() < (0.7 if me.skulls >= 80 else 0.4)):
+            # Prefer progress, not an identical shortest-path rush every game.
+            target = max(candidates, key=lambda c: (2 if c.owner == enemy else 0) - 0.45*min(abs(c.idx//7-i//7)+abs(c.idx%7-i%7) for i in EVENT_STARTS[enemy]) + random.uniform(0,3.5))
+            _event_capture_impl(db, em, cells, me, target.idx, runtime, t)
+            break
         for c in abilities:
             if _event_use_impl(db, em, cells, stats, me, c.idx, runtime, t)["status"] == "ok":
-                break
+                return
 
 
 def _event_action(room_id, player_id, cell_index, ability):
@@ -1997,6 +2167,12 @@ def _event_action(room_id, player_id, cell_index, ability):
         me = next((s for s in stats if s.name == player_id), None)
         if me is None:
             return {"status": "player_not_found"}
+        if em.winner or em.status == "FINISHED":
+            return {"status": "finished"}
+        slot = db.query(EventSlot).filter_by(room_id=room_id, name=player_id).first()
+        if slot and slot.is_bot:
+            return {"status": "player_left"}
+        if slot: touch(slot, now(), 5.0)
         cells = load_cells(db, "e", room_id)
         row, runtime = _event_runtime(db, room_id)
         t = now()

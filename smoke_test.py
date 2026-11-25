@@ -58,7 +58,7 @@ for p in (42, 48): cells[p]["owner"] = 2
 st = {"status": "RUNNING", "team1_players": l1["team1_players"], "team2_players": l1["team2_players"],
       "team1_skulls": [50, 50], "team1_energy": [0, 0], "team1_rating": [0, 0],
       "team2_skulls": [50, 50], "team2_energy": [0, 0], "team2_rating": [0, 0], "cells": cells, "winner": "", "turn": 0, "turn_end_time": 0}
-assert c.post(f"/api/update_event_match?room_id={room}", json=st).json()["status"] == "updated"
+assert c.post(f"/api/update_event_match?room_id={room}", json=st).json()["status"] == "already_initialized"
 ev = g("/get_event_match", room_id=room); assert len(ev["cells"]) == 49 and ev["team1_players"] == l1["team1_players"]
 t1 = l1["team1_players"][0]
 print("capture", g("/event_capture", room_id=room, player_id=t1, cell_index=1), g("/event_use", room_id=room, player_id=t1, cell_index=0))
